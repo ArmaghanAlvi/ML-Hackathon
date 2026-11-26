@@ -1,0 +1,48 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# --- Secrets ---
+.env
+.env.local
+*.env.local
+
+# --- Node / frontend ---
+node_modules/
+frontend/dist/
+frontend/dev-dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# --- Data (never committed) ---
+ml/data/**
+!ml/data/.gitkeep
+
+# --- Backend response cache (raw SerpApi JSON) ---
+backend/app/cache/*.json
+
+# --- Large artifacts / weights / media ---
+*.pt
+*.pth
+*.safetensors
+*.npy
+*.npz
+*.onnx
+*.mp4
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- OS / editors ---
+.DS_Store
+.idea/
+.vscode/
+
+# NOTE: these ARE committed on purpose (do not ignore):
+#   ml/artifacts/thresholds.json, ml/artifacts/metrics/, ml/artifacts/figures/, labeling/lens_cache/

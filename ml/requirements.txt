@@ -1,0 +1,18 @@
+# ML / notebook dependencies (Streams A and B). Not needed to run the backend or tests.
+# Unpinned for now: pin exact versions (pip freeze) once the pipeline works.
+torch
+torchvision
+transformers
+huggingface_hub
+datasets
+scikit-learn
+xgboost
+pandas
+numpy
+pillow
+imagehash
+matplotlib
+tqdm
+requests
+jupyter
+streamlit

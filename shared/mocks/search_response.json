@@ -1,0 +1,208 @@
+{
+  "query_id": "mock-0001",
+  "detections": [
+    {
+      "x": 0.32,
+      "y": 0.18,
+      "w": 0.3,
+      "h": 0.66,
+      "label": "bottle",
+      "score": 0.91
+    },
+    {
+      "x": 0.05,
+      "y": 0.55,
+      "w": 0.22,
+      "h": 0.3,
+      "label": "cup",
+      "score": 0.47
+    }
+  ],
+  "selected_box": {
+    "x": 0.32,
+    "y": 0.18,
+    "w": 0.3,
+    "h": 0.66,
+    "label": "bottle",
+    "score": 0.91
+  },
+  "candidates": [
+    {
+      "id": "c1",
+      "title": "HydroPeak 32 oz Insulated Stainless Steel Water Bottle, Wide Mouth, Slate",
+      "description": "Double-wall vacuum insulation, keeps drinks cold 24h / hot 12h.",
+      "price": 34.95,
+      "currency": "USD",
+      "rating": 4.8,
+      "review_count": 12450,
+      "adjusted_rating": 4.784,
+      "trust_rating": null,
+      "source": "Amazon",
+      "link": "https://example.com/products/c1",
+      "image_url": "https://placehold.co/400x400/png?text=c1",
+      "match_label": "identical",
+      "match_score": 0.94,
+      "top_reviews": [
+        "Keeps ice overnight even in a hot car.",
+        "Lid seal is great, no leaks in my bag."
+      ]
+    },
+    {
+      "id": "c2",
+      "title": "HydroPeak Wide Mouth Bottle 32oz - Slate Blue",
+      "description": null,
+      "price": 29.99,
+      "currency": "USD",
+      "rating": 4.7,
+      "review_count": 860,
+      "adjusted_rating": 4.63,
+      "trust_rating": null,
+      "source": "Target",
+      "link": "https://example.com/products/c2",
+      "image_url": "https://placehold.co/400x400/png?text=c2",
+      "match_label": "identical",
+      "match_score": 0.91,
+      "top_reviews": [
+        "Same bottle as Amazon, cheaper on sale."
+      ]
+    },
+    {
+      "id": "c3",
+      "title": "HydroPeak 32 oz Wide Mouth with Flex Cap",
+      "description": "Includes flex cap and straw lid.",
+      "price": 39.0,
+      "currency": "USD",
+      "rating": null,
+      "review_count": null,
+      "adjusted_rating": null,
+      "trust_rating": null,
+      "source": "REI",
+      "link": "https://example.com/products/c3",
+      "image_url": "https://placehold.co/400x400/png?text=c3",
+      "match_label": "identical",
+      "match_score": 0.86,
+      "top_reviews": []
+    },
+    {
+      "id": "c4",
+      "title": "IronFlask 32 oz Vacuum Insulated Bottle, 3 Lids",
+      "description": "Comes with straw, spout and flip lids.",
+      "price": 24.99,
+      "currency": "USD",
+      "rating": 4.5,
+      "review_count": 3200,
+      "adjusted_rating": 4.513,
+      "trust_rating": null,
+      "source": "Walmart",
+      "link": "https://example.com/products/c4",
+      "image_url": "https://placehold.co/400x400/png?text=c4",
+      "match_label": "similar",
+      "match_score": 0.74,
+      "top_reviews": [
+        "Great value with three lids."
+      ]
+    },
+    {
+      "id": "c5",
+      "title": "Simple Modern Summit 32oz Water Bottle",
+      "description": null,
+      "price": 19.97,
+      "currency": "USD",
+      "rating": 4.2,
+      "review_count": 540,
+      "adjusted_rating": 4.421,
+      "trust_rating": null,
+      "source": "Amazon",
+      "link": "https://example.com/products/c5",
+      "image_url": "https://placehold.co/400x400/png?text=c5",
+      "match_label": "similar",
+      "match_score": 0.69,
+      "top_reviews": [
+        "Dents easily but holds temperature well."
+      ]
+    },
+    {
+      "id": "c6",
+      "title": "TrailMate Insulated Sport Bottle 30 oz",
+      "description": "Powder-coated finish, leakproof chug cap.",
+      "price": 27.5,
+      "currency": "USD",
+      "rating": 4.6,
+      "review_count": null,
+      "adjusted_rating": 4.56,
+      "trust_rating": null,
+      "source": "Dick's Sporting Goods",
+      "link": "https://example.com/products/c6",
+      "image_url": "https://placehold.co/400x400/png?text=c6",
+      "match_label": "similar",
+      "match_score": 0.63,
+      "top_reviews": []
+    },
+    {
+      "id": "c7",
+      "title": "Insulated Lunch Box with Bottle Holder",
+      "description": null,
+      "price": 12.99,
+      "currency": "USD",
+      "rating": 4.4,
+      "review_count": 900,
+      "adjusted_rating": null,
+      "trust_rating": null,
+      "source": "Amazon",
+      "link": "https://example.com/products/c7",
+      "image_url": "https://placehold.co/400x400/png?text=c7",
+      "match_label": "none",
+      "match_score": 0.31,
+      "top_reviews": []
+    },
+    {
+      "id": "c8",
+      "title": "Classic Vacuum Thermos 40 oz, Hammertone Green",
+      "description": null,
+      "price": 45.0,
+      "currency": "USD",
+      "rating": 4.7,
+      "review_count": 2100,
+      "adjusted_rating": null,
+      "trust_rating": null,
+      "source": "Thermos Store",
+      "link": "https://example.com/products/c8",
+      "image_url": "https://placehold.co/400x400/png?text=c8",
+      "match_label": "none",
+      "match_score": 0.42,
+      "top_reviews": []
+    }
+  ],
+  "top_cheapest": [
+    "c5",
+    "c4",
+    "c6"
+  ],
+  "top_rated": [
+    "c1",
+    "c2",
+    "c6"
+  ],
+  "best_value": [
+    "c1",
+    "c5",
+    "c4"
+  ],
+  "frontier": [
+    "c1",
+    "c2",
+    "c4",
+    "c5",
+    "c6"
+  ],
+  "cached": false,
+  "timings_ms": {
+    "detect": 85.0,
+    "lens": 2140.0,
+    "shopping": 1310.0,
+    "fetch_images": 640.0,
+    "match": 210.0,
+    "rank": 2.0,
+    "total": 4387.0
+  }
+}

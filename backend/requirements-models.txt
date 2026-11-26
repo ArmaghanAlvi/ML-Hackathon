@@ -1,0 +1,5 @@
+# Heavy model dependencies: installed when real models are swapped in (Wed 12/2).
+#   pip install -r backend/requirements-models.txt
+torch
+transformers
+ultralytics

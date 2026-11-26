@@ -1,0 +1,6 @@
+/* Owner: Stream D · Roadmap: Stage 5a. Tailwind v4 entry. */
+@import "tailwindcss";
+
+:root {
+  color-scheme: light dark;
+}

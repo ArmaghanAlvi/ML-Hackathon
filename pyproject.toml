@@ -1,0 +1,12 @@
+[project]
+name = "product-compare"
+version = "0.1.0"
+description = "ML hackathon: photo -> product detection -> web visual search -> trained matcher -> ranked comparison"
+requires-python = ">=3.11"
+
+# No packaging: run everything from the repo root with the root .venv.
+# Dependencies live in backend/requirements.txt (+ requirements-models.txt) and ml/requirements.txt.
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["backend/tests", "ml/tests"]

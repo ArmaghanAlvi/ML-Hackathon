@@ -1,0 +1,12 @@
+# Backend runtime + tests. Lightweight on purpose: no torch / transformers / ultralytics here
+# (those live in requirements-models.txt).
+fastapi
+uvicorn[standard]
+pydantic>=2
+pydantic-settings
+httpx
+pillow
+numpy
+python-multipart
+python-dotenv
+pytest
