@@ -1,4 +1,4 @@
-# Product Compare (working title)
+# SnapShop (working title)
 
 A phone-friendly web app for comparing products from a single picture. You give it a photo, screenshot or image URL; a detector boxes the product, and web visual search (Google Lens and Google Shopping via SerpApi) fetches candidate products. Our own trained matcher labels each candidate **identical**, **similar** or **none**, and the app ranks the matches into **Cheapest**, **Top rated** (Bayesian average that accounts for review count) and **Best value** (price-vs-rating Pareto frontier plus a weight slider). Built for the ML hackathon, demo day Tue Dec 8.
 
