@@ -21,7 +21,7 @@ Build a phone-friendly web app that takes a photo, screenshot or image URL, find
 | Sat 12/5 – Mon 12/7 | 10 Demo prep | **CP4 (Sun 12/6 evening):** code freeze |
 | Tue 12/8 | Demo, 7pm | — |
 
-**Dependency chain:** Stage 0d (API contract) → Stages 4 and 5 can run in parallel. Stage 2 → 3 → 6e. Stage 1a → 4b → 6b. Stage 6c labels → 6e and 8.
+**Dependency chain:** Stage 0d (API contract) → Stages 4 and 5 can run in parallel. Stage 2 → 3 → 6e. Stage 6a (photos + locked split) → 6b. Stage 1a → 4b → 6b. Stage 6c labels → 6e and 8.
 
 ---
 
@@ -43,10 +43,14 @@ ml/
                               # embed.py, train_head.py, thresholds.py, eval_offline.py,
                               # eval_live.py, reviews_prepare.py, train_reviews.py, train_reranker.py
 labeling/
-  queries/                    # real photos + manifest.csv
+  queries/                    # real photos (EXIF stripped) + manifest.csv (incl. object_id, query_box)
   lens_cache/                 # raw Lens responses for labeled photos
+  lens_cache/images/          # gitignored: local copies of candidate images
+  candidates.csv              # one row per Lens candidate; joins labels.csv on photo_id + candidate_pos
   guidelines.md
-  label_tool.py               # tiny Streamlit labeler
+  prepare_queries.py          # resize, strip EXIF, write manifest rows
+  collect_candidates.py       # Lens via serp.py → lens_cache + candidates.csv + images
+  label_tool.py               # tiny Streamlit labeler (blind, shuffled)
   labels.csv
 backend/
   app/main.py                 # FastAPI app; also serves the built frontend
@@ -69,9 +73,9 @@ demo/
 ## Stage 0 — Kickoff & setup (Wed 11/25 – Thu 11/26)
 **Why this stage:** Four people working in parallel need shared decisions, a shared repo, and an agreed API shape. Without those, the first few days go to rework.
 
-- **0a. Lock decisions.** Pick the target user, 3–5 product categories (e.g. Home & Kitchen, Office Products, Electronics accessories, Sports & Outdoors), a shortlist of 8–10 demo objects you own that are easy to find online, and a project name. Record them in `docs/decisions.md`.
+- **0a. Lock decisions.** Pick the target user, 3–5 product categories (e.g. Home & Kitchen, Office Products, Electronics accessories, Sports & Outdoors), a shortlist of 8–10 demo objects you own that are easy to find online, and a project name. Record them in `docs/decisions.md`. Also record the evaluation plan (the metrics and split rules in 6d, 6e and 7d) before any results exist.
   *Why:* the categories decide which data you download, and the demo objects decide what you test against all week.
-- **0b. Accounts & keys.** Set up SerpApi (decide on the free tier vs. a shared $25 Starter plan), Colab/Kaggle, a GitHub repo, and a Hugging Face account for storing weights. Create `.env.example`.
+- **0b. Accounts & keys.** Set up SerpApi (decide on the free tier vs. a shared $25 Starter plan), Colab/Kaggle, a GitHub repo, and a Hugging Face account for storing weights. Create `.env.example`. Agree the search budget: about 50 Lens searches for the real-photo set (6b), the rest for development and demo caching, with about 20% in reserve.
   *Why:* every later stage needs these, and quota decisions affect how carefully you cache.
 - **0c. Repo skeleton & conventions.** Create the layout above, plus a `.gitignore` covering `ml/data/`, large artifacts and `.env`. Agree on a branch and PR habit and write a README with setup steps.
   *Why:* this avoids merge chaos and keeps large binaries out of git.
@@ -124,7 +128,7 @@ demo/
 ## Stage 3 — Baselines & matcher training (Sun 11/29 – Wed 12/2)
 **Why this stage:** This is the main model, and it's what the 35 rigor points rest on.
 
-- **3a. Embeddings.** `ml/src/embed.py` computes ResNet-50 and SigLIP 2 embeddings for every image, plus 2–4 augmented versions of each training image (crops, color jitter, blur, busy backgrounds). Save them as `.npy`.
+- **3a. Embeddings.** `ml/src/embed.py` computes ResNet-50 and SigLIP 2 embeddings for every image, plus 2–4 augmented versions of each training image (crops, color jitter, blur, busy backgrounds). Save them as `.npy`. Expose an importable `embed_images(images, backbone)` (L2-normalized) so the live evaluation (6e) uses identical preprocessing.
   *Why:* with a frozen backbone, training only touches these vectors, so it takes minutes. The augmentations simulate messy real photos.
 - **3b. Baselines.** `ml/notebooks/02_baselines.ipynb` reports Recall@1 and Recall@5 on validation for ResNet-50 and zero-shot SigLIP, saved to `ml/artifacts/metrics/baselines.json`.
   *Why:* these are the numbers your model has to beat.
@@ -134,6 +138,7 @@ demo/
   *Why:* this is the trained component that's clearly your own work.
 - **3e. Cutoffs.** `ml/src/thresholds.py` picks the Identical and Similar score cutoffs on validation and writes them to `ml/artifacts/thresholds.json`.
   *Why:* setting cutoffs on test data would be leakage.
+  `thresholds.json` has one owner (Stream A). Stage 6 may propose cutoffs tuned on calibration photos only; the team picks which pair ships at CP3.
 - **3f. One-time test evaluation.** `ml/src/eval_offline.py` runs only after the model is frozen. It produces Recall@K bars, a precision-recall curve and ROC-AUC, saved to `ml/artifacts/figures/`.
   *Why:* using the test set once keeps the result honest.
 
@@ -148,7 +153,7 @@ demo/
   *Why:* the frontend can connect to a real server from day one.
 - **4b. Search client.** `backend/app/services/serp.py` wraps Lens (URL and upload flows) and Shopping (search on the match title plus any text refinement). It caches responses to disk keyed by image hash and text, logs quota use, and has timeouts.
   *Why:* caching protects your quota and powers cached mode on demo day.
-- **4c. Detection service.** `backend/app/services/detect.py` returns boxes and the crop for the selected box, or applies the fallback from 1b.
+- **4c. Detection service.** `backend/app/services/detect.py` returns boxes and the crop for the selected box, or applies the fallback from 1b. The matcher scores this crop (or the whole image if there's no box) in both the app and the real-photo evaluation (6b, 6e). Record the crop padding in `docs/decisions.md` at CP1.
   *Why:* it supplies the boxes the UI draws and gives web search a cleaner query.
 - **4d. Matcher service.** `backend/app/services/matcher.py` loads SigLIP, the trained head and the cutoffs once at startup. It fetches candidate images concurrently, preferring Lens's full-size `image` over `thumbnail`, then scores and labels each candidate.
   *Why:* this is where your model runs in the live app. Small thumbnails hurt accuracy.
@@ -195,44 +200,47 @@ demo/
 ## Stage 6 — Real-photo evaluation (photos Sat 11/28 →, labeling Tue 12/1 – Fri 12/4)
 **Why this stage:** This is the strongest evidence you'll have. It measures your model on the kind of data the app actually sees.
 
-- **6a. Capture photos.** Take 30–50 photos of real items with varied lighting and backgrounds, including the demo objects. Store them in `labeling/queries/` with a `manifest.csv` listing ID, description and category.
-  *Why:* the photos don't depend on the model, so this can start right away.
-- **6b. Collect candidates.** Run Lens on each photo once and save the top 20 results to `labeling/lens_cache/`. Budget 30–50 Lens searches.
-  *Why:* every model is then compared on exactly the same candidates.
-- **6c. Label.** Write `labeling/guidelines.md` defining identical (same model, any color, matching the training positives), similar and no. Use `labeling/label_tool.py` to fill `labels.csv`. Two people label the same 100 items so you can report agreement (Cohen's kappa).
-  *Why:* consistent labels make the numbers trustworthy, and agreement is cheap evidence of rigor.
-- **6d. Calibration vs. test split.** Keep about 10–15 photos for calibration, to optionally re-tune cutoffs for real photos, and use the rest as the live test set.
-  *Why:* the same no-leakage rule applies to your own data.
-- **6e. Live evaluation.** `ml/src/eval_live.py` reports precision@3 for Identical, a 3-class confusion matrix, and a comparison table of Lens order vs. ResNet vs. zero-shot SigLIP vs. your model. Write results and 5–10 categorized failures in `docs/evaluation.md`.
-  *Why:* this is the headline result and chart for the Results & evidence criterion.
+- **6a. Capture photos.** Photograph 25–30 distinct items, 1–2 photos each (about 40–50 total), across varied conditions: clean and cluttered backgrounds, low light, odd angles, partly blocked, held in hand. Include every demo object. `labeling/prepare_queries.py` resizes to about 1024px, strips EXIF, renames each file to its `photo_id`, and writes `labeling/queries/manifest.csv` with `photo_id, object_id, filename, description, category, split, query_box, is_demo_object`.
+  *Why:* the photos don't depend on the model, so this can start right away. `object_id` ties together every photo of the same physical item, varied conditions make the error analysis meaningful, and stripping EXIF removes GPS location before photos are committed.
+- **6b. Collect candidates.** `labeling/collect_candidates.py` runs Lens once per photo through `serp.py`, using the same query crop the app sends (from `query_box`). It saves raw JSON to `labeling/lens_cache/`, writes the top 20 to `labeling/candidates.csv` (`photo_id, candidate_pos, title, link, source, price, rating, review_count, image_url, thumbnail_url, local_image_path, image_kind`), and downloads every candidate image to `labeling/lens_cache/images/` (gitignored, shared as a zip). Budget 30–50 Lens searches.
+  *Why:* every model is then compared on exactly the same candidates, and local copies survive store image links breaking before evaluation.
+- **6c. Label.** Write `labeling/guidelines.md` defining identical (same model, any color, matching the training positives), similar and no, with edge cases. `labeling/label_tool.py` hides the Lens position and all model scores and shuffles candidate order. Start with a 10-item warm-up everyone labels and discusses (excluded from agreement). Two people label the same 100 items; report Cohen's kappa, unweighted and linear-weighted, and settle disagreements on the overlap set by discussion.
+  *Why:* blind labeling keeps the Lens baseline honest, weighted kappa suits ordered labels (none < similar < identical), and agreement is cheap evidence of rigor.
+  The two double-labelers are B and D, so A isn't double-labeling on the day the real matcher ships. Labeling can open Tue 12/1 evening once candidates are collected.
+- **6d. Calibration vs. test split.** Split by `object_id` with a fixed seed, stratified by category: about 10–15 photos for calibration (optionally re-tuning cutoffs for real photos), the rest as the live test set. Do this right after 6a and lock it before 6b.
+  *Why:* the same no-leakage rule applies to your own data. Splitting by photo would let another photo of a test item into calibration.
+- **6e. Live evaluation.** `ml/src/eval_live.py` ranks each photo's candidates by Lens order, ResNet, zero-shot SigLIP and your model (same crop, same candidates, same local images). On the test photos it reports NDCG@3 (identical = 2, similar = 1) as the primary metric, plus Precision@3 for Identical and Hit@1, each with bootstrap 95% confidence intervals over test objects. It also reports a 3-class confusion matrix at validation cutoffs and again at cutoffs tuned on calibration photos only, and the retrieval ceiling (share of test photos with at least one identical candidate in Lens's top 20). Write results and 5–10 categorized failures in `docs/evaluation.md`.
+  *Why:* this is the headline result and chart for the Results & evidence criterion. With about 30–35 test photos, the intervals show which differences are real, and the ceiling separates Lens misses from matcher misses.
 
-**Done when:** you have the comparison table, figures and error analysis for the live test set (CP3).
+**Done when:** you have the comparison table with confidence intervals, the agreement score, figures and error analysis for the live test set (CP3).
 
 ---
 
 ## Stage 7 — Review-helpfulness model (second model, Mon 11/30 – Fri 12/4; first to cut)
 **Why this stage:** A second trained model with its own baseline strengthens the ML core, and it feeds the trust-adjusted rating.
 
-- **7a. Prepare data.** `ml/src/reviews_prepare.py` samples about 50k reviews from your categories. Helpful = 3 or more votes, not helpful = 0 votes on reviews old enough to have collected votes. Split by product.
-  *Why:* the labels already exist in the dataset, and splitting by product avoids leakage.
-- **7b. Baseline.** TF-IDF + logistic regression (`ml/notebooks/06_review_model.ipynb`), adapted from the course NLP notebook.
-- **7c. Model.** Fine-tune DistilBERT for 1–2 epochs on Colab with `ml/src/train_reviews.py`, and save it to the HF Hub.
-- **7d. Evaluate.** Report macro-F1, PR-AUC and a confusion matrix against the baseline, in `docs/evaluation.md`.
-  *Why:* the classes are imbalanced, so accuracy would be misleading.
-- **7e. Integrate.** `backend/app/services/reviews.py` fetches reviews for the top few products only, scores them, and computes a trust-adjusted rating plus the 2–3 most informative reviews per card. Cache everything.
+- **7a. Prepare data.** `ml/src/reviews_prepare.py` samples about 50k reviews from your categories that are old enough to have collected votes (pick the cutoff date from the data's timestamp range). Helpful = 3 or more votes, not helpful = 0 votes; drop reviews with 1–2. Remove exact duplicate review texts, then split by product (`parent_asin`) 70/15/15, keeping the natural class ratio in validation and test.
+  *Why:* the labels already exist in the dataset, and splitting by product after removing duplicate texts avoids leakage.
+- **7b. Baselines.** (i) The length heuristic, which is the C3 stub (`min(1, word_count / 100)`). (ii) TF-IDF + logistic regression (`ml/notebooks/06_review_model.ipynb`), adapted from the course NLP notebook: vectorizer fit on train only, C tuned on validation, balanced class weights.
+  *Why:* helpful votes track review length strongly, so the model has to beat a length rule to show it adds anything.
+- **7c. Model.** Fine-tune DistilBERT for 1–2 epochs on Colab (T4, max length 256, fp16) with `ml/src/train_reviews.py`, choose the checkpoint by validation PR-AUC, and save it to the HF Hub.
+- **7d. Evaluate.** Report PR-AUC (primary), macro-F1 at a cutoff chosen on validation, a confusion matrix, and PR curves for all three models, once on test, in `docs/evaluation.md`. Also check 10–20 Google reviews from the backend cache by eye.
+  *Why:* the classes are imbalanced, so accuracy would be misleading. The Google check shows how big the Amazon → Google gap is.
+- **7e. Integrate.** `backend/app/services/reviews.py` fetches reviews for the top few products only, scores them, and computes a trust-adjusted rating plus the 2–3 most informative reviews per card. Cache everything. `ml/inference/reviews.py` falls back to the length stub if the weights fail to load.
   *Why:* each product's reviews cost extra searches. Note that Google reviews differ from the Amazon training reviews, and list that as a limitation.
+  Stream B writes the trust_rating formula in docs/decisions.md by Tue 12/1 (draft: trust = (Σ hᵢ·rᵢ + k·adjusted_rating) / (Σ hᵢ + k), k = 3, where hᵢ is review helpfulness and rᵢ its stars; null when no reviews were fetched). Stream C implements it.
 
-**Done when:** you have the metrics comparison, and cards show a trust-adjusted rating and top reviews. If it gets cut, the Bayesian average stays as the adjusted rating.
+**Done when:** you have the three-model metrics comparison, and cards show a trust-adjusted rating and top reviews. If DistilBERT is late, TF-IDF + logistic regression ships behind the same interface. If the stage gets cut, the Bayesian average stays as the adjusted rating.
 
 ---
 
 ## Stage 8 — XGBoost re-ranker (optional, Thu 12/3 – Sat 12/5)
 **Why this stage:** It adds a third trained model that uses the rubric's own example (XGBoost), trained on data you labeled yourselves. Only attempt it if Stage 6 reaches about 50 labeled photos.
 
-- **8a. Features.** For each candidate: model score, ResNet score, zero-shot score, Lens position, title-text similarity, and price relative to the median.
-- **8b. Train.** `ml/src/train_reranker.py` uses `rank:pairwise`, with cross-validation grouped by photo.
-  *Why:* grouping keeps all results for one photo in the same fold, so the model is never tested on a photo it trained on.
-- **8c. Evaluate & integrate.** Compare NDCG@3 and precision@3 against Lens order and against your model alone. If it wins, use it behind a flag in `matcher.py`.
+- **8a. Features.** For each candidate: model score, ResNet score, zero-shot score, Lens position, title-text similarity, and price relative to the median. Candidate metadata comes from `labeling/candidates.csv` and images from `labeling/lens_cache/images/`.
+- **8b. Train.** `ml/src/train_reranker.py` uses `rank:pairwise`, with cross-validation grouped by `object_id`.
+  *Why:* grouping keeps all results for one photo in the same fold, so the model is never tested on a photo, or another photo of the same item, that it trained on.
+- **8c. Evaluate & integrate.** Compare NDCG@3 and precision@3 against Lens order and against your model alone. If it wins, use it behind a flag in `matcher.py`. Re-ranker numbers come only from out-of-fold predictions in grouped cross-validation; it never appears as a row in the 6e held-out table.
 
 **Done when:** you have a grouped cross-validation table, plus a decision on whether to use it in the app.
 
@@ -281,3 +289,8 @@ demo/
 - **Breakdown 7: Stage 9 (9a, 9b, 9e) + 10.** Integration and demo prep happen together at the end.
 
 These groupings also line up with how four people could split the work later.
+
+---
+
+## Changelog
+- **2026-11-26 (TICKET-B01):** Stream B plan sync: object-based photo split, `candidates.csv` and local candidate images, blind labeling, new real-photo metrics with confidence intervals, three-tier review-model baselines. Cross-stream items X1–X9 were approved by the team, so none are marked "Proposed".

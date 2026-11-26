@@ -30,7 +30,8 @@ Find out which stream you are working for and only edit that stream's paths.
 - Fit any transform, scaler or vectorizer (e.g. TF-IDF) on **train only**.
 - Choose thresholds and hyperparameters on **validation**.
 - Use the **test split once**, after the model is frozen.
-- For the real-photo set, split **by photo** into calibration and test.
+- For the real-photo set, split **by `object_id`** (the physical item) into calibration and test, so every photo of the same item stays in one split. Lock the split before collecting Lens candidates.
+- Re-ranker cross-validation is grouped by `object_id`, and re-ranker numbers come only from out-of-fold predictions (never from the held-out real-photo test table).
 
 ## 4. Quota rule
 - All SerpApi calls go through `backend/app/services/serp.py` and its cache (`backend/app/services/cache.py`).
