@@ -24,6 +24,9 @@ npm-debug.log*
 ml/data/**
 !ml/data/.gitkeep
 
+# --- Local copies of Lens candidate images (shared as a zip, never committed) ---
+labeling/lens_cache/images/
+
 # --- Backend response cache (raw SerpApi JSON) ---
 backend/app/cache/*.json
 
@@ -48,4 +51,5 @@ snapshots/
 .vscode/
 
 # NOTE: these ARE committed on purpose (do not ignore):
-#   ml/artifacts/thresholds.json, ml/artifacts/metrics/, ml/artifacts/figures/, labeling/lens_cache/
+#   ml/artifacts/thresholds.json, ml/artifacts/metrics/, ml/artifacts/figures/, labeling/lens_cache/*.json
+#   (labeling/lens_cache/images/ is ignored above)
