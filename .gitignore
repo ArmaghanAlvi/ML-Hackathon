@@ -39,6 +39,9 @@ backend/app/cache/*.json
 # --- Notebooks ---
 .ipynb_checkpoints/
 
+# --- Local project snapshots (scripts/snapshot.py) ---
+snapshots/
+
 # --- OS / editors ---
 .DS_Store
 .idea/

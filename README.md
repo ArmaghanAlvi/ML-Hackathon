@@ -17,10 +17,20 @@ Requirements: Python 3.11+, Node 22.12+ (vitest 5 needs it), npm, git. Run every
 | Run tests | `make test` | `.venv/bin/pytest` → `cd frontend && npm run typecheck && npm test` |
 | Build frontend | `make build` | `cd frontend && npm run build` |
 | Serve built app | `make serve` | `cd frontend && npm run build`, then `.venv/bin/uvicorn backend.app.main:app --port 8000` and open http://localhost:8000 |
+| Safe zip snapshot | `make snapshot` | `python scripts/snapshot.py` (add `--dry-run` to preview, `--name <label>`, `--out <folder>`) |
 
 Copy `.env.example` to `.env` (and `frontend/.env.example` to `frontend/.env`) to change settings. With the defaults, the backend returns the canonical mock (`USE_MOCK_RESPONSE=true`) and the frontend uses it directly (`VITE_USE_MOCKS=true`).
 
 ML / notebook dependencies are **not** installed by default: `pip install -r ml/requirements.txt` when you need them.
+
+### Snapshots
+`make snapshot` zips the project **as it is on your disk right now** (committed, uncommitted and new files) into `snapshots/<project>-<UTC time>-<commit>[-dirty].zip`, whether or not your branch is caught up with GitHub. It never fetches, pushes or changes git state, and needs only plain Python (no venv). It is "safe" to share because:
+- it follows `.gitignore` (no `.venv`, `node_modules`, `dist`, `ml/data`, caches, weights),
+- a built-in denylist also drops secrets (`.env`, keys, credentials), datasets, weights, media and the real photos in `labeling/queries/`, even if `.gitignore` misses them,
+- text files containing a filled-in secret (e.g. `SERPAPI_KEY=<real value>`, tokens, private keys) are skipped,
+- files over 25 MB are skipped.
+
+Each zip includes `SNAPSHOT_INFO.txt` with the branch, commit, ahead/behind vs. upstream (as of your last `git fetch`), uncommitted changes and the full list of included and skipped files. Run `--dry-run` first if you want to check what goes in.
 
 ## Repo map
 
