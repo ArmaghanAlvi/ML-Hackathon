@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import os
 import subprocess
 import sys
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -246,3 +248,83 @@ def test_source_candidates():
     assert rp.source_candidates(args) == [ucsd[2]]
     args = rp.parse_args(["scan", "--category", "X", "--input", "local.jsonl"])
     assert rp.source_candidates(args) == ["local.jsonl"]
+
+
+# 9. EOF on a real HTTP stream (regression: "ValueError: read of closed file" after the last row) ------------------
+
+class AutoClosingRaw(io.RawIOBase):
+    """Mimics urllib3's HTTPResponse (requests' `resp.raw`) with auto_close=True: once it has returned EOF it
+    reports itself closed, and any further read raises ValueError("read of closed file")."""
+
+    def __init__(self, data: bytes):
+        self._data = io.BytesIO(data)
+        self._eof = False
+        self.auto_close = True
+        self.decode_content = True
+
+    def readable(self) -> bool:
+        return True
+
+    @property
+    def closed(self) -> bool:
+        return self._eof or super().closed
+
+    def readinto(self, b) -> int:
+        if self._eof:
+            raise ValueError("read of closed file")
+        n = self._data.readinto(b)
+        if n == 0:
+            self._eof = True
+        return n
+
+
+def fake_requests(data: bytes) -> types.ModuleType:
+    """A stand-in `requests` module whose get() returns `data` through AutoClosingRaw. No network."""
+    module = types.ModuleType("requests")
+
+    class Response:
+        def __init__(self):
+            self.raw = AutoClosingRaw(data)
+
+        def raise_for_status(self):
+            return None
+
+    module.get = lambda url, stream=False, timeout=None: Response()
+    return module
+
+
+@pytest.mark.parametrize("compressed", [True, False], ids=["gzip", "plain"])
+def test_http_stream_eof_completes(tmp_path, monkeypatch, compressed):
+    body = "\n".join(toy_lines()) + "\n"
+    data = gzip.compress(body.encode()) if compressed else body.encode()
+    monkeypatch.setitem(sys.modules, "requests", fake_requests(data))
+    url = "https://example.invalid/Toy.jsonl" + (".gz" if compressed else "")
+    code, s, _ = run(tmp_path, url)
+    assert s["error"] is None
+    assert code == 0 and s["completed"] is True
+    assert s["n_rows"] == N_VALID and s["source"] == url
+
+
+# 10. malformed_examples -------------------------------------------------------------------------------------------
+
+def test_malformed_examples_in_toy_file(tmp_path, toy_gz):
+    _, s, _ = run(tmp_path, toy_gz)
+    ex = s["malformed_examples"]
+    assert [e["line_no"] for e in ex] == [12, 13]  # 11 good lines, then the two bad ones
+    assert ex[0]["reason"].startswith("invalid JSON:") and ex[0]["line"] == '{"rating": 5.0, "text": "broken"'
+    assert ex[1]["reason"] == "missing helpful_vote" and "no votes field" in ex[1]["line"]
+
+
+def test_malformed_examples_capped_and_truncated(tmp_path):
+    good = json.dumps({"timestamp": MARCH_2019_MS, "helpful_vote": 0, "text": "ok"})
+    bad = ["x" * 500, "[1, 2]", json.dumps({"helpful_vote": 1}), json.dumps({"timestamp": 1, "helpful_vote": "lots"}),
+           json.dumps({"timestamp": 1, "helpful_vote": -3}), "{", "{"]
+    src = write_gz(tmp_path / "Bad.jsonl.gz", [good, *bad, good])
+    _, s, _ = run(tmp_path, src)
+    assert s["n_rows"] == 2 and s["n_malformed"] == 7
+    ex = s["malformed_examples"]
+    assert len(ex) == 5
+    assert ex[0]["line"] == "x" * 200 and ex[0]["reason"].startswith("invalid JSON:")
+    assert [e["reason"].split(" (")[0].split(":")[0] for e in ex[1:]] == [
+        "not a JSON object", "missing timestamp", "bad timestamp/helpful_vote", "negative helpful_vote"]
+    assert [e["line_no"] for e in ex] == [2, 3, 4, 5, 6]

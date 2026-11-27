@@ -8,7 +8,8 @@ scan (Stage 1a)
     Streams one category's raw review file (`{Category}.jsonl.gz`) in a single pass, without downloading it
     first, and writes three outputs to `--out` (default `ml/data/reviews/scan`, gitignored):
 
-    * `{Category}_summary.json`: exact aggregates over every parsed row: row and malformed counts, timestamp
+    * `{Category}_summary.json`: exact aggregates over every parsed row: row and malformed counts (plus the
+      first 5 malformed lines, truncated to 200 chars, with the reason, in `malformed_examples`), timestamp
       range (with the detected unit per row), a helpful-vote histogram (0..49 and 50+), a rating histogram,
       the verified count, and per-month vote buckets (`n, v0, v1, v2, v3plus, v5plus, v10plus`).
     * `{Category}_thin.parquet`: every `--thin-every`-th parsed row, numeric columns only (no text).
@@ -71,6 +72,8 @@ MONTH_FIELDS = ("n", "v0", "v1", "v2", "v3plus", "v5plus", "v10plus")
 STRATA = ("pos2", "zero")
 INT16_MAX = 32767
 INT32_MAX = 2**31 - 1
+MALFORMED_EXAMPLES = 5        # malformed lines kept verbatim in the summary
+MALFORMED_CHARS = 200         # ... each truncated to this many characters
 
 
 # --------------------------------------------------------------------------- sources
@@ -93,8 +96,42 @@ def open_source(src: str):
         resp = requests.get(src, stream=True, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
         resp.raw.decode_content = False  # we detect and decompress gzip ourselves
-        return resp.raw
+        resp.raw.auto_close = False      # urllib3 otherwise marks the stream closed as soon as it hits EOF
+        return _EOFSafeRaw(resp.raw)
     return open(src, "rb")
+
+
+class _EOFSafeRaw(io.RawIOBase):
+    """Wraps a network stream so that, once it has returned EOF, later reads return EOF again without touching it.
+
+    Why: urllib3 (requests' `resp.raw`) closes itself when it reaches the end of the body. At the end of a gzip
+    member, GzipFile reads once more to look for another member; BufferedReader then sees a closed raw stream and
+    raises `ValueError: read of closed file`, which turned every complete scan into an error at EOF.
+    Our own `closed` state only changes when `close()` is called.
+    """
+
+    def __init__(self, raw):
+        self._raw = raw
+        self._eof = False
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        if self._eof:
+            return 0
+        n = self._raw.readinto(b)
+        if not n:
+            self._eof = True
+            return 0
+        return n
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                self._raw.close()
+            finally:
+                super().close()
 
 
 def _json_loads():
@@ -106,22 +143,33 @@ def _json_loads():
         return json.loads
 
 
-def iter_records(stream, loads=None):
-    """Yield one dict per non-blank line, or None for a line that isn't a JSON object.
+def iter_lines(stream, loads=None):
+    """Yield `(line_no, raw_line, record, reason)` per non-blank line (line_no is 1-based, blank lines included).
 
+    `record` is the parsed dict, or None with `reason` saying why the line isn't a JSON object.
     Gzip is detected by the first two bytes (1f 8b), not by the file name.
     """
     loads = loads or _json_loads()
     buf = stream if hasattr(stream, "peek") else io.BufferedReader(stream, READ_BUFFER)
     lines = gzip.GzipFile(fileobj=buf) if buf.peek(2)[:2] == GZIP_MAGIC else buf
-    for line in lines:
+    for line_no, line in enumerate(lines, start=1):
         if not line.strip():
             continue
         try:
             obj = loads(line)
-        except ValueError:  # json.JSONDecodeError, orjson.JSONDecodeError and UnicodeDecodeError all subclass it
-            obj = None
-        yield obj if isinstance(obj, dict) else None
+        except ValueError as exc:  # json/orjson JSONDecodeError and UnicodeDecodeError all subclass ValueError
+            yield line_no, line, None, f"invalid JSON: {exc}"
+            continue
+        if isinstance(obj, dict):
+            yield line_no, line, obj, None
+        else:
+            yield line_no, line, None, f"not a JSON object ({type(obj).__name__})"
+
+
+def iter_records(stream, loads=None):
+    """Yield one dict per non-blank line, or None for a line that isn't a JSON object."""
+    for _, _, rec, _ in iter_lines(stream, loads):
+        yield rec
 
 
 # --------------------------------------------------------------------------- state
@@ -143,6 +191,7 @@ class ScanState:
 
         self.n_rows = 0                      # parsed rows; also the next row_idx
         self.n_malformed = 0
+        self.malformed_examples: list[dict] = []  # first MALFORMED_EXAMPLES bad lines, for debugging
         self.ts_min_ms: int | None = None
         self.ts_max_ms: int | None = None
         self.ts_unit_counts = {"ms": 0, "s": 0}
@@ -174,20 +223,34 @@ class ScanState:
             self._day_to_month[day] = key
         return key
 
-    def update(self, rec: dict | None) -> bool:
-        """Add one record. Returns True if it was parsed, False if counted as malformed."""
+    def _malformed(self, reason: str, raw=None, line_no: int | None = None) -> bool:
+        self.n_malformed += 1
+        if len(self.malformed_examples) < MALFORMED_EXAMPLES:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = bytes(raw).decode("utf-8", errors="replace")
+            self.malformed_examples.append({
+                "line_no": line_no, "reason": reason,
+                "line": None if raw is None else raw.rstrip("\r\n")[:MALFORMED_CHARS],
+            })
+        return False
+
+    def update(self, rec: dict | None, raw=None, line_no: int | None = None, reason: str | None = None) -> bool:
+        """Add one record. Returns True if it was parsed, False if counted as malformed.
+
+        `raw`, `line_no` and `reason` (from `iter_lines`) are only used to describe malformed lines.
+        """
         if rec is None:
-            self.n_malformed += 1
-            return False
+            return self._malformed(reason or "not a JSON object", raw, line_no)
+        for field in ("timestamp", "helpful_vote"):
+            if field not in rec:
+                return self._malformed(f"missing {field}", raw, line_no)
         try:
             ts = int(rec["timestamp"])
             votes = int(rec["helpful_vote"])
-        except (KeyError, TypeError, ValueError):
-            self.n_malformed += 1
-            return False
+        except (TypeError, ValueError) as exc:
+            return self._malformed(f"bad timestamp/helpful_vote: {type(exc).__name__}: {exc}", raw, line_no)
         if votes < 0:
-            self.n_malformed += 1
-            return False
+            return self._malformed(f"negative helpful_vote ({votes})", raw, line_no)
 
         row_idx = self.n_rows
 
@@ -290,6 +353,7 @@ class ScanState:
             "rows_per_sec": round(self.n_rows / seconds, 1) if seconds > 0 else 0.0,
             "n_rows": self.n_rows,
             "n_malformed": self.n_malformed,
+            "malformed_examples": list(self.malformed_examples),
             "ts_min_ms": self.ts_min_ms,
             "ts_max_ms": self.ts_max_ms,
             "ts_unit_counts": dict(self.ts_unit_counts),
@@ -434,9 +498,9 @@ def scan(args: argparse.Namespace, sources: list[str] | None = None) -> int:
                 stream = open_source(src)
                 used = src
                 try:
-                    for rec in iter_records(stream, loads):
+                    for line_no, raw, rec, reason in iter_lines(stream, loads):
                         consumed += 1
-                        if not state.update(rec):
+                        if not state.update(rec, raw, line_no, reason):
                             continue
                         n = state.n_rows
                         if n % 10_000 == 0:
