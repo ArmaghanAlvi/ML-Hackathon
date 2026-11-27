@@ -1,7 +1,6 @@
 // Owner: Stream D · Roadmap: Stage 5b
 // Purpose: camera capture / upload (capture="environment"), image URL, optional text refinement.
-// STUB: minimal form; paste-a-screenshot and validation polish come later.
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import type { SearchRequest } from '../types/api'
 
 export interface ImageInputValue {
@@ -28,6 +27,28 @@ export default function ImageInput({ onSubmit, disabled }: Props) {
   const [imageUrl, setImageUrl] = useState('')
   const [text, setText] = useState('')
   const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    function handlePaste(event: ClipboardEvent) {
+      const items = event.clipboardData?.items
+      if (!items) return
+
+      for (const item of Array.from(items)) {
+        if (!item.type.startsWith('image/')) continue
+
+        const pastedFile = item.getAsFile()
+        if (!pastedFile) continue
+
+        event.preventDefault()
+        setFile(pastedFile)
+        setError(null)
+        break
+      }
+    }
+
+    document.addEventListener('paste', handlePaste)
+    return () => document.removeEventListener('paste', handlePaste)
+  }, [])
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
