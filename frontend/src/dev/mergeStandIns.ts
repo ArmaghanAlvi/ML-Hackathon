@@ -21,6 +21,6 @@ export function mergeStandIns(response: SearchResponse | DevSearchResponse): Dev
   return {
     ...response,
     candidates: candidatesWithNoneStandIns,
-    suggestions: suggestions ?? sampleSuggestions,
+    suggestions: suggestions?.length ? suggestions : sampleSuggestions,
   }
 }
