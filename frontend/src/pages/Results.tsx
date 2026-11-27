@@ -1,20 +1,27 @@
 // Owner: Stream D · Roadmap: Stage 5d
 // Purpose: show the SearchResponse: pipeline animation, detections, top-3 tabs, cards, value scatter.
-// STUB: animation and scatter are placeholders.
-import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { useState } from 'react'
-import { search } from '../api/client'
+import { Link } from 'react-router-dom'
+import type { Dispatch, SetStateAction } from 'react'
 import DetectionOverlay from '../components/DetectionOverlay'
+import ImageInput, { type ImageInputValue } from '../components/ImageInput'
 import PipelineAnimation from '../components/PipelineAnimation'
 import ProductCard from '../components/ProductCard'
 import TopThreeList from '../components/TopThreeList'
 import ValueScatter from '../components/ValueScatter'
-import type { Box, Candidate, SearchRequest, SearchResponse } from '../types/api'
+import type { Candidate, SearchResponse } from '../types/api'
 
-interface ResultsState {
-  response?: SearchResponse
-  imageSrc?: string | null
-  request?: SearchRequest
+interface SearchResult {
+  response: SearchResponse
+  imageSrc: string | null
+}
+
+interface Props {
+  value: ImageInputValue
+  onChange: Dispatch<SetStateAction<ImageInputValue>>
+  onSearch: (value: ImageInputValue) => void
+  result: SearchResult | null
+  loading: boolean
+  error: string | null
 }
 
 function Group({ title, items }: { title: string; items: Candidate[] }) {
@@ -36,87 +43,63 @@ function Group({ title, items }: { title: string; items: Candidate[] }) {
   )
 }
 
-export default function Results() {
-  const state = (useLocation().state ?? {}) as ResultsState
-  const navigate = useNavigate()
-  const response = state.response
-  const [selectedBox, setSelectedBox] = useState<Box | null>(response?.selected_box ?? null)
-  const [searchingSelection, setSearchingSelection] = useState(false)
-  const [selectionError, setSelectionError] = useState<string | null>(null)
-
-  if (!response) {
-    return (
-      <p>
-        No results yet.{' '}
-        <Link to="/" className="underline">
-          Start a search
-        </Link>
-      </p>
-    )
-  }
-
-  const identical = response.candidates.filter((c) => c.match_label === 'identical')
-  const similar = response.candidates.filter((c) => c.match_label === 'similar')
-  const none = response.candidates.filter((c) => c.match_label === 'none')
-
-  async function searchSelectedArea() {
-    if (!selectedBox || !state.request) return
-
-    setSearchingSelection(true)
-    setSelectionError(null)
-    try {
-      const refinedResponse = await search({ ...state.request, box: selectedBox })
-      navigate('/results', {
-        replace: true,
-        state: { ...state, response: refinedResponse, request: { ...state.request, box: selectedBox } },
-      })
-    } catch (e) {
-      setSelectionError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSearchingSelection(false)
-    }
-  }
+export default function Results({ value, onChange, onSearch, result, loading, error }: Props) {
+  const response = result?.response
+  const identical = response?.candidates.filter((c) => c.match_label === 'identical') ?? []
+  const similar = response?.candidates.filter((c) => c.match_label === 'similar') ?? []
+  const none = response?.candidates.filter((c) => c.match_label === 'none') ?? []
 
   return (
     <div className="space-y-6">
-      <PipelineAnimation timings={response.timings_ms} cached={response.cached} />
-      <DetectionOverlay
-        imageSrc={state.imageSrc ?? null}
-        detections={response.detections}
-        selected={selectedBox}
-        onSelectionChange={setSelectedBox}
-      />
-      {selectedBox && state.request && (
-        <div className="space-y-2">
-          <button
-            type="button"
-            onClick={searchSelectedArea}
-            disabled={searchingSelection}
-            className="rounded bg-sky-600 px-4 py-2 font-medium text-white disabled:opacity-50"
-          >
-            {searchingSelection ? 'Searching selected area…' : 'Search selected area'}
-          </button>
-          {selectionError && <p className="text-sm text-red-600">{selectionError}</p>}
-        </div>
+      <ImageInput value={value} onChange={onChange} onSubmit={onSearch} compact />
+      {loading && (
+        <p role="status" className="text-sm text-sky-700 dark:text-sky-300">
+          {response ? 'Searching… Previous results remain visible.' : 'Searching…'}
+        </p>
       )}
-      <TopThreeList response={response} />
-      <Group title="Identical" items={identical} />
-      <Group title="Similar" items={similar} />
-      <details className="space-y-3">
-        <summary className="cursor-pointer text-lg font-semibold">
-          None <span className="text-sm font-normal text-slate-500">({none.length})</span>
-        </summary>
-        {none.length === 0 ? (
-          <p className="text-sm text-slate-500">No non-matching products.</p>
-        ) : (
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {none.map((c) => (
-              <ProductCard key={c.id} candidate={c} />
-            ))}
-          </div>
-        )}
-      </details>
-      <ValueScatter response={response} />
+      {error && <p className="text-sm text-red-600">{error}</p>}
+      {response ? (
+        <>
+          <PipelineAnimation timings={response.timings_ms} cached={response.cached} />
+          <DetectionOverlay
+            imageSrc={result.imageSrc}
+            detections={response.detections}
+            selected={value.request.box ?? null}
+            onSelectionChange={(box) =>
+              onChange((current) => ({ ...current, request: { ...current.request, box } }))
+            }
+          />
+          <TopThreeList response={response} />
+          <Group title="Identical" items={identical} />
+          <Group title="Similar" items={similar} />
+          <details className="space-y-3">
+            <summary className="cursor-pointer text-lg font-semibold">
+              None <span className="text-sm font-normal text-slate-500">({none.length})</span>
+            </summary>
+            {none.length === 0 ? (
+              <p className="text-sm text-slate-500">No non-matching products.</p>
+            ) : (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                {none.map((c) => (
+                  <ProductCard key={c.id} candidate={c} />
+                ))}
+              </div>
+            )}
+          </details>
+          <ValueScatter response={response} />
+        </>
+      ) : (
+        <p>
+          {loading ? 'Your search is in progress.' : 'No results yet. '}
+          {!loading && (
+            <>
+              <Link to="/" className="underline">
+                Start a search
+              </Link>
+            </>
+          )}
+        </p>
+      )}
     </div>
   )
 }
