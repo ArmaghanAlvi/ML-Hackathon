@@ -2,7 +2,7 @@
 // Purpose: one candidate: image, title, price, listed + adjusted rating, store link, match label.
 import type { Candidate } from '../types/api'
 
-function formatPrice(c: Candidate): string {
+export function formatPrice(c: Candidate): string {
   if (c.price == null) return 'No price'
 
   try {
