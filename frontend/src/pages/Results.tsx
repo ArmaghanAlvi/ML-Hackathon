@@ -8,7 +8,9 @@ import PipelineAnimation from '../components/PipelineAnimation'
 import ProductCard from '../components/ProductCard'
 import TopThreeList from '../components/TopThreeList'
 import ValueScatter from '../components/ValueScatter'
-import type { Candidate, SearchResponse } from '../types/api'
+import { mergeStandIns } from '../dev/mergeStandIns'
+import type { DevCandidate } from '../dev/types'
+import type { SearchResponse } from '../types/api'
 
 interface SearchResult {
   response: SearchResponse
@@ -24,7 +26,7 @@ interface Props {
   error: string | null
 }
 
-function Group({ title, items }: { title: string; items: Candidate[] }) {
+function Group({ title, items }: { title: string; items: DevCandidate[] }) {
   return (
     <section className="space-y-2">
       <h2 className="text-lg font-semibold">
@@ -44,7 +46,8 @@ function Group({ title, items }: { title: string; items: Candidate[] }) {
 }
 
 export default function Results({ value, onChange, onSearch, result, loading, error }: Props) {
-  const response = result?.response
+  const response = result ? mergeStandIns(result.response) : null
+  const imageSrc = result?.imageSrc ?? null
   const identical = response?.candidates.filter((c) => c.match_label === 'identical') ?? []
   const similar = response?.candidates.filter((c) => c.match_label === 'similar') ?? []
   const none = response?.candidates.filter((c) => c.match_label === 'none') ?? []
@@ -62,7 +65,7 @@ export default function Results({ value, onChange, onSearch, result, loading, er
         <>
           <PipelineAnimation timings={response.timings_ms} cached={response.cached} />
           <DetectionOverlay
-            imageSrc={result.imageSrc}
+            imageSrc={imageSrc}
             detections={response.detections}
             selected={value.request.box ?? null}
             onSelectionChange={(box) =>

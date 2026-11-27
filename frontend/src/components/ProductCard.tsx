@@ -1,6 +1,7 @@
 // Owner: Stream D · Roadmap: Stage 5d
 // Purpose: one candidate: image, title, price, listed + adjusted rating, store link, match label.
 import type { Candidate } from '../types/api'
+import type { DevCandidate } from '../dev/types'
 
 export function formatPrice(c: Candidate): string {
   if (c.price == null) return 'No price'
@@ -24,7 +25,7 @@ const matchLabel: Record<Candidate['match_label'], string> = {
   none: 'None',
 }
 
-export default function ProductCard({ candidate: c }: { candidate: Candidate }) {
+export default function ProductCard({ candidate: c }: { candidate: Candidate & Pick<DevCandidate, 'reviews_scanned'> }) {
   return (
     <article className="flex gap-3 rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
       {c.image_url && (
@@ -44,6 +45,9 @@ export default function ProductCard({ candidate: c }: { candidate: Candidate }) 
         <p className="text-slate-600 dark:text-slate-400">
           Sold by <span className="font-medium">{c.source || 'Store unavailable'}</span>
         </p>
+        {c.reviews_scanned != null && (
+          <p className="text-xs text-slate-500">Trust rating from {c.reviews_scanned.toLocaleString()} reviews</p>
+        )}
         {c.link ? (
           <a href={c.link} target="_blank" rel="noopener noreferrer" className="inline-block font-medium text-sky-700 underline dark:text-sky-400">
             Visit store
