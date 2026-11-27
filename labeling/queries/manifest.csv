@@ -1,1 +1,1 @@
-photo_id,filename,description,category,split
+photo_id,object_id,filename,description,category,split,query_box,is_demo_object
