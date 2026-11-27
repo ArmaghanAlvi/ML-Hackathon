@@ -1,27 +1,23 @@
 // Owner: Stream D · Roadmap: Stage 5b
 // Purpose: collect an image (camera/upload or URL) + optional text, call search(), go to Results.
-// STUB: minimal flow; loading animation and paste-a-screenshot come later (5b, 5f).
-import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { search } from '../api/client'
+import type { Dispatch, SetStateAction } from 'react'
 import ImageInput, { type ImageInputValue } from '../components/ImageInput'
 
-export default function Home() {
-  const navigate = useNavigate()
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+interface Props {
+  value: ImageInputValue
+  onChange: Dispatch<SetStateAction<ImageInputValue>>
+  onSearch: (value: ImageInputValue) => void
+  loading: boolean
+  error: string | null
+}
 
-  async function handleSubmit(value: ImageInputValue) {
-    setLoading(true)
-    setError(null)
-    try {
-      const response = await search(value.request)
-      navigate('/results', { state: { response, imageSrc: value.previewSrc, request: value.request } })
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
+export default function Home({ value, onChange, onSearch, loading, error }: Props) {
+  const navigate = useNavigate()
+
+  function handleSubmit(nextValue: ImageInputValue) {
+    onSearch(nextValue)
+    navigate('/results')
   }
 
   return (
@@ -30,7 +26,11 @@ export default function Home() {
       <p className="text-slate-600 dark:text-slate-400">
         Take a photo, upload a screenshot, or paste an image URL.
       </p>
-      <ImageInput onSubmit={handleSubmit} disabled={loading} />
+      <ImageInput
+        value={value}
+        onChange={onChange}
+        onSubmit={handleSubmit}
+      />
       {loading && <p className="text-sm">Searching…</p>}
       {error && <p className="text-sm text-red-600">{error}</p>}
     </section>

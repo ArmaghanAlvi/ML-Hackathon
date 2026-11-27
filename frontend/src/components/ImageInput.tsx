@@ -1,6 +1,13 @@
 // Owner: Stream D · Roadmap: Stage 5b
 // Purpose: camera capture / upload (capture="environment"), image URL, optional text refinement.
-import { useEffect, useState, type FormEvent } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useState,
+  type Dispatch,
+  type FormEvent,
+  type SetStateAction,
+} from 'react'
 import type { SearchRequest } from '../types/api'
 
 export interface ImageInputValue {
@@ -9,8 +16,11 @@ export interface ImageInputValue {
 }
 
 interface Props {
+  value: ImageInputValue
+  onChange: Dispatch<SetStateAction<ImageInputValue>>
   onSubmit: (value: ImageInputValue) => void
   disabled?: boolean
+  compact?: boolean
 }
 
 function readAsDataUrl(file: File): Promise<string> {
@@ -22,11 +32,27 @@ function readAsDataUrl(file: File): Promise<string> {
   })
 }
 
-export default function ImageInput({ onSubmit, disabled }: Props) {
-  const [file, setFile] = useState<File | null>(null)
-  const [imageUrl, setImageUrl] = useState('')
-  const [text, setText] = useState('')
+export default function ImageInput({ value, onChange, onSubmit, disabled, compact = false }: Props) {
   const [error, setError] = useState<string | null>(null)
+
+  const setImageFile = useCallback(async (file: File) => {
+    try {
+      const dataUrl = await readAsDataUrl(file)
+      const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
+      onChange((current) => ({
+        request: {
+          ...current.request,
+          image_base64: base64,
+          image_url: null,
+          box: null,
+        },
+        previewSrc: dataUrl,
+      }))
+      setError(null)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not read the selected image.')
+    }
+  }, [onChange])
 
   useEffect(() => {
     function handlePaste(event: ClipboardEvent) {
@@ -40,62 +66,98 @@ export default function ImageInput({ onSubmit, disabled }: Props) {
         if (!pastedFile) continue
 
         event.preventDefault()
-        setFile(pastedFile)
-        setError(null)
+        void setImageFile(pastedFile)
         break
       }
     }
 
     document.addEventListener('paste', handlePaste)
     return () => document.removeEventListener('paste', handlePaste)
-  }, [])
+  }, [setImageFile])
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
     setError(null)
-    const refinement = text.trim() || null
-    if (file) {
-      const dataUrl = await readAsDataUrl(file)
-      const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
-      onSubmit({ request: { image_base64: base64, text: refinement }, previewSrc: dataUrl })
-    } else if (imageUrl.trim()) {
-      onSubmit({ request: { image_url: imageUrl.trim(), text: refinement }, previewSrc: imageUrl.trim() })
-    } else {
+    const imageUrl = value.request.image_url?.trim()
+    if (!value.request.image_base64 && !imageUrl) {
       setError('Add a photo or an image URL.')
+      return
     }
+
+    onSubmit({
+      request: {
+        ...value.request,
+        image_url: value.request.image_base64 ? null : imageUrl,
+        text: value.request.text?.trim() || null,
+      },
+      previewSrc: value.previewSrc,
+    })
   }
 
   const field = 'w-full rounded border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-900'
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-3">
-      <label className="block space-y-1">
-        <span className="text-sm font-medium">Photo or screenshot</span>
+    <form onSubmit={handleSubmit} className={compact ? 'flex flex-wrap items-center gap-3 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900' : 'space-y-3'}>
+      {compact && (
+        value.previewSrc ? (
+          <img src={value.previewSrc} alt="Current search image" className="h-12 w-12 flex-none rounded object-cover" />
+        ) : (
+          <div className="flex h-12 w-12 flex-none items-center justify-center rounded bg-slate-100 text-xs text-slate-500 dark:bg-slate-800">
+            No image
+          </div>
+        )
+      )}
+      <label className={compact ? 'cursor-pointer rounded border border-slate-300 px-3 py-2 text-sm font-medium dark:border-slate-700' : 'block space-y-1'}>
+        <span className={compact ? '' : 'text-sm font-medium'}>
+          {compact ? 'Replace image' : 'Photo or screenshot'}
+        </span>
         <input
           type="file"
           accept="image/*"
           capture="environment"
-          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          className="block w-full text-sm"
+          onChange={(e) => {
+            const file = e.currentTarget.files?.[0]
+            e.currentTarget.value = ''
+            if (file) void setImageFile(file)
+          }}
+          className={compact ? 'sr-only' : 'block w-full text-sm'}
         />
       </label>
-      <label className="block space-y-1">
-        <span className="text-sm font-medium">…or image URL</span>
+      <label className={compact ? 'min-w-40 flex-1' : 'block space-y-1'}>
+        <span className={compact ? 'sr-only' : 'text-sm font-medium'}>…or image URL</span>
         <input
           type="url"
-          placeholder="https://example.com/product.jpg"
-          value={imageUrl}
-          onChange={(e) => setImageUrl(e.target.value)}
+          placeholder={compact ? 'Image URL' : 'https://example.com/product.jpg'}
+          value={value.request.image_url ?? ''}
+          onChange={(e) => {
+            const imageUrl = e.currentTarget.value
+            onChange((current) => ({
+              request: {
+                ...current.request,
+                image_base64: null,
+                image_url: imageUrl || null,
+                box: null,
+              },
+              previewSrc: imageUrl || null,
+            }))
+            setError(null)
+          }}
           className={field}
         />
       </label>
-      <label className="block space-y-1">
-        <span className="text-sm font-medium">Refine (optional)</span>
+      <label className={compact ? 'min-w-40 flex-1' : 'block space-y-1'}>
+        <span className={compact ? 'sr-only' : 'text-sm font-medium'}>Refine (optional)</span>
         <input
           type="text"
           placeholder='e.g. "yellow version"'
-          value={text}
-          onChange={(e) => setText(e.target.value)}
+          value={value.request.text ?? ''}
+          onChange={(e) => {
+            const text = e.currentTarget.value
+            onChange((current) => ({
+              ...current,
+              request: { ...current.request, text },
+            }))
+          }}
           className={field}
         />
       </label>
