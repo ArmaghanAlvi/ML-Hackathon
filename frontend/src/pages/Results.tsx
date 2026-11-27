@@ -99,23 +99,21 @@ export default function Results({ value, onChange, onSearch, result, loading, er
               >
                 Items
               </button>
-              {suggestions.length > 0 && (
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={activeTab === 'suggestions'}
-                  onClick={() => setActiveTab('suggestions')}
-                  className={`border-b-2 px-3 py-2 text-sm font-medium ${
-                    activeTab === 'suggestions'
-                      ? 'border-sky-600 text-sky-700 dark:text-sky-400'
-                      : 'border-transparent text-slate-600 dark:text-slate-400'
-                  }`}
-                >
-                  Suggestions
-                </button>
-              )}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'suggestions'}
+                onClick={() => setActiveTab('suggestions')}
+                className={`border-b-2 px-3 py-2 text-sm font-medium ${
+                  activeTab === 'suggestions'
+                    ? 'border-sky-600 text-sky-700 dark:text-sky-400'
+                    : 'border-transparent text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Suggestions
+              </button>
             </div>
-            {activeTab === 'items' || suggestions.length === 0 ? (
+            {activeTab === 'items' ? (
               <div role="tabpanel" className="space-y-6">
                 <Group title="Identical" items={identical} />
                 <Group title="Similar" items={similar} />
@@ -136,8 +134,11 @@ export default function Results({ value, onChange, onSearch, result, loading, er
               </div>
             ) : (
               <div role="tabpanel" className="space-y-4">
-                <div className="flex flex-wrap gap-2">
-                  {suggestions.map((suggestion, index) => (
+                {suggestions.length === 0 ? (
+                  <p className="text-sm text-slate-500">No suggestions available yet.</p>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {suggestions.map((suggestion, index) => (
                     <div key={`${suggestion.keyword}-${index}`} className="flex items-center gap-1">
                       <button
                         type="button"
@@ -166,9 +167,10 @@ export default function Results({ value, onChange, onSearch, result, loading, er
                         Search
                       </button>
                     </div>
-                  ))}
-                </div>
-                {selectedSuggestion == null ? (
+                    ))}
+                  </div>
+                )}
+                {suggestions.length === 0 ? null : selectedSuggestion == null ? (
                   <p className="text-sm text-slate-500">Choose a suggestion to see matching products.</p>
                 ) : !selectedSuggestionData ? (
                   <p className="text-sm text-slate-500">Choose a suggestion to see matching products.</p>
