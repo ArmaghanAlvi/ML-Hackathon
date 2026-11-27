@@ -57,6 +57,7 @@ export default function Results() {
 
   const identical = response.candidates.filter((c) => c.match_label === 'identical')
   const similar = response.candidates.filter((c) => c.match_label === 'similar')
+  const none = response.candidates.filter((c) => c.match_label === 'none')
 
   async function searchSelectedArea() {
     if (!selectedBox || !state.request) return
@@ -101,6 +102,20 @@ export default function Results() {
       <TopThreeList response={response} />
       <Group title="Identical" items={identical} />
       <Group title="Similar" items={similar} />
+      <details className="space-y-3">
+        <summary className="cursor-pointer text-lg font-semibold">
+          None <span className="text-sm font-normal text-slate-500">({none.length})</span>
+        </summary>
+        {none.length === 0 ? (
+          <p className="text-sm text-slate-500">No non-matching products.</p>
+        ) : (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {none.map((c) => (
+              <ProductCard key={c.id} candidate={c} />
+            ))}
+          </div>
+        )}
+      </details>
       <ValueScatter response={response} />
     </div>
   )
