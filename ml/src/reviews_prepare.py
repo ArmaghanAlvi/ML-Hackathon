@@ -273,8 +273,7 @@ class ScanState:
 
         text = rec.get("text")
         text = text if isinstance(text, str) else None
-        # Must match the length heuristic in ml/inference/reviews.py
-        # (score_reviews today; it moves to length_score in Breakdown 1 Step 6).
+        # Must match length_score in ml/inference/reviews.py.
         word_count = len((text or "").split())
         images = rec.get("images")
         n_images = len(images) if isinstance(images, list) else 0
