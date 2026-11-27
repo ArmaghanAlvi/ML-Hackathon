@@ -1,17 +1,20 @@
 // Owner: Stream D · Roadmap: Stage 5d
 // Purpose: show the SearchResponse: pipeline animation, detections, top-3 tabs, cards, value scatter.
-// STUB: layout only; animation, overlay interaction and scatter are placeholders.
-import { Link, useLocation } from 'react-router-dom'
+// STUB: animation and scatter are placeholders.
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { useState } from 'react'
+import { search } from '../api/client'
 import DetectionOverlay from '../components/DetectionOverlay'
 import PipelineAnimation from '../components/PipelineAnimation'
 import ProductCard from '../components/ProductCard'
 import TopThreeList from '../components/TopThreeList'
 import ValueScatter from '../components/ValueScatter'
-import type { Candidate, SearchResponse } from '../types/api'
+import type { Box, Candidate, SearchRequest, SearchResponse } from '../types/api'
 
 interface ResultsState {
   response?: SearchResponse
   imageSrc?: string | null
+  request?: SearchRequest
 }
 
 function Group({ title, items }: { title: string; items: Candidate[] }) {
@@ -35,7 +38,11 @@ function Group({ title, items }: { title: string; items: Candidate[] }) {
 
 export default function Results() {
   const state = (useLocation().state ?? {}) as ResultsState
+  const navigate = useNavigate()
   const response = state.response
+  const [selectedBox, setSelectedBox] = useState<Box | null>(response?.selected_box ?? null)
+  const [searchingSelection, setSearchingSelection] = useState(false)
+  const [selectionError, setSelectionError] = useState<string | null>(null)
 
   if (!response) {
     return (
@@ -51,14 +58,46 @@ export default function Results() {
   const identical = response.candidates.filter((c) => c.match_label === 'identical')
   const similar = response.candidates.filter((c) => c.match_label === 'similar')
 
+  async function searchSelectedArea() {
+    if (!selectedBox || !state.request) return
+
+    setSearchingSelection(true)
+    setSelectionError(null)
+    try {
+      const refinedResponse = await search({ ...state.request, box: selectedBox })
+      navigate('/results', {
+        replace: true,
+        state: { ...state, response: refinedResponse, request: { ...state.request, box: selectedBox } },
+      })
+    } catch (e) {
+      setSelectionError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSearchingSelection(false)
+    }
+  }
+
   return (
     <div className="space-y-6">
       <PipelineAnimation timings={response.timings_ms} cached={response.cached} />
       <DetectionOverlay
         imageSrc={state.imageSrc ?? null}
         detections={response.detections}
-        selected={response.selected_box ?? null}
+        selected={selectedBox}
+        onSelectionChange={setSelectedBox}
       />
+      {selectedBox && state.request && (
+        <div className="space-y-2">
+          <button
+            type="button"
+            onClick={searchSelectedArea}
+            disabled={searchingSelection}
+            className="rounded bg-sky-600 px-4 py-2 font-medium text-white disabled:opacity-50"
+          >
+            {searchingSelection ? 'Searching selected area…' : 'Search selected area'}
+          </button>
+          {selectionError && <p className="text-sm text-red-600">{selectionError}</p>}
+        </div>
+      )}
       <TopThreeList response={response} />
       <Group title="Identical" items={identical} />
       <Group title="Similar" items={similar} />
