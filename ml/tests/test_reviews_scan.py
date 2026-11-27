@@ -321,10 +321,22 @@ def test_malformed_examples_capped_and_truncated(tmp_path):
            json.dumps({"timestamp": 1, "helpful_vote": -3}), "{", "{"]
     src = write_gz(tmp_path / "Bad.jsonl.gz", [good, *bad, good])
     _, s, _ = run(tmp_path, src)
-    assert s["n_rows"] == 2 and s["n_malformed"] == 7
+    assert s["n_rows"] == 2 and s["n_malformed"] == 6
+    assert s["n_negative_votes"] == 1  # well-formed, excluded, not malformed (no example recorded)
     ex = s["malformed_examples"]
     assert len(ex) == 5
     assert ex[0]["line"] == "x" * 200 and ex[0]["reason"].startswith("invalid JSON:")
     assert [e["reason"].split(" (")[0].split(":")[0] for e in ex[1:]] == [
-        "not a JSON object", "missing timestamp", "bad timestamp/helpful_vote", "negative helpful_vote"]
-    assert [e["line_no"] for e in ex] == [2, 3, 4, 5, 6]
+        "not a JSON object", "missing timestamp", "bad timestamp/helpful_vote", "invalid JSON"]
+    assert [e["line_no"] for e in ex] == [2, 3, 4, 5, 7]
+
+
+def test_negative_votes_excluded_everywhere(tmp_path):
+    rows = [{"timestamp": MARCH_2019_MS, "helpful_vote": v, "text": "t", "rating": 5.0} for v in (0, -1, 3)]
+    src = write_gz(tmp_path / "Neg.jsonl.gz", [json.dumps(r) for r in rows])
+    _, s, out = run(tmp_path, src, "--thin-every", "1")
+    assert s["n_rows"] == 2 and s["n_malformed"] == 0 and s["n_negative_votes"] == 1
+    assert s["malformed_examples"] == []
+    assert s["months"]["2019-03"]["n"] == 2 and sum(s["helpful_vote_hist"].values()) == 2
+    assert s["texts_seen"] == {"pos2": 1, "zero": 1}
+    assert pq.read_table(out / "Toy_thin.parquet").column("helpful_vote").to_pylist() == [0, 3]

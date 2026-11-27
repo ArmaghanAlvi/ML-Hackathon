@@ -12,6 +12,8 @@ scan (Stage 1a)
       first 5 malformed lines, truncated to 200 chars, with the reason, in `malformed_examples`), timestamp
       range (with the detected unit per row), a helpful-vote histogram (0..49 and 50+), a rating histogram,
       the verified count, and per-month vote buckets (`n, v0, v1, v2, v3plus, v5plus, v10plus`).
+      `n_negative_votes` counts well-formed reviews with helpful_vote < 0, which can't be a real vote count:
+      they are excluded from every statistic and sample, but not counted as malformed.
     * `{Category}_thin.parquet`: every `--thin-every`-th parsed row, numeric columns only (no text).
     * `{Category}_texts.parquet`: a seeded reservoir sample (Algorithm R) of at most `--keep-texts` reviews per
       stratum: `pos2` (helpful_vote >= 2) and `zero` (helpful_vote == 0). Reviews with 1 vote aren't kept.
@@ -191,6 +193,7 @@ class ScanState:
 
         self.n_rows = 0                      # parsed rows; also the next row_idx
         self.n_malformed = 0
+        self.n_negative_votes = 0               # valid rows with helpful_vote < 0: excluded, not malformed
         self.malformed_examples: list[dict] = []  # first MALFORMED_EXAMPLES bad lines, for debugging
         self.ts_min_ms: int | None = None
         self.ts_max_ms: int | None = None
@@ -235,7 +238,7 @@ class ScanState:
         return False
 
     def update(self, rec: dict | None, raw=None, line_no: int | None = None, reason: str | None = None) -> bool:
-        """Add one record. Returns True if it was parsed, False if counted as malformed.
+        """Add one record. Returns True if it was used, False if malformed or excluded (negative helpful_vote).
 
         `raw`, `line_no` and `reason` (from `iter_lines`) are only used to describe malformed lines.
         """
@@ -250,7 +253,10 @@ class ScanState:
         except (TypeError, ValueError) as exc:
             return self._malformed(f"bad timestamp/helpful_vote: {type(exc).__name__}: {exc}", raw, line_no)
         if votes < 0:
-            return self._malformed(f"negative helpful_vote ({votes})", raw, line_no)
+            # Not a possible vote count (likely a source glitch). Excluded rather than mapped to 0, which would
+            # invent a "not helpful" label; counted on its own because the line itself is well-formed.
+            self.n_negative_votes += 1
+            return False
 
         row_idx = self.n_rows
 
@@ -353,6 +359,7 @@ class ScanState:
             "rows_per_sec": round(self.n_rows / seconds, 1) if seconds > 0 else 0.0,
             "n_rows": self.n_rows,
             "n_malformed": self.n_malformed,
+            "n_negative_votes": self.n_negative_votes,
             "malformed_examples": list(self.malformed_examples),
             "ts_min_ms": self.ts_min_ms,
             "ts_max_ms": self.ts_max_ms,
