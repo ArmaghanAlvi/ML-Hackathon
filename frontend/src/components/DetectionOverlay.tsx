@@ -1,17 +1,17 @@
 // Owner: Stream D · Roadmap: Stage 5c
 // Purpose: draw detection boxes over the image; tap a box to select it.
-// STUB: placeholder (static boxes + list); canvas animation and tap-to-select come later.
 import type { Box } from '../types/api'
 
 interface Props {
   imageSrc: string | null
   detections: Box[]
   selected: Box | null
+  onSelectionChange: (selected: Box | null) => void
 }
 
 const same = (a: Box, b: Box | null) => !!b && a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h
 
-export default function DetectionOverlay({ imageSrc, detections, selected }: Props) {
+export default function DetectionOverlay({ imageSrc, detections, selected, onSelectionChange }: Props) {
   return (
     <section className="space-y-2">
       <h2 className="text-lg font-semibold">Detections</h2>
@@ -19,9 +19,15 @@ export default function DetectionOverlay({ imageSrc, detections, selected }: Pro
         <div className="relative inline-block max-w-full">
           <img src={imageSrc} alt="query" className="max-h-64 rounded" />
           {detections.map((b, i) => (
-            <div
+            <button
+              type="button"
               key={i}
-              className={`absolute border-2 ${same(b, selected) ? 'border-sky-500' : 'border-slate-300'}`}
+              aria-label={`${same(b, selected) ? 'Deselect' : 'Select'} ${b.label} detection`}
+              aria-pressed={same(b, selected)}
+              onClick={() => onSelectionChange(same(b, selected) ? null : b)}
+              className={`absolute cursor-pointer border-2 p-0 ${
+                same(b, selected) ? 'border-sky-500 bg-sky-500/10' : 'border-slate-300 bg-transparent'
+              }`}
               style={{ left: `${b.x * 100}%`, top: `${b.y * 100}%`, width: `${b.w * 100}%`, height: `${b.h * 100}%` }}
             />
           ))}

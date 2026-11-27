@@ -16,7 +16,7 @@ export default function Home() {
     setError(null)
     try {
       const response = await search(value.request)
-      navigate('/results', { state: { response, imageSrc: value.previewSrc } })
+      navigate('/results', { state: { response, imageSrc: value.previewSrc, request: value.request } })
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
