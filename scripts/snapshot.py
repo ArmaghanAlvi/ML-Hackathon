@@ -15,11 +15,19 @@ What makes it "safe":
      any hit is skipped and reported.
   4. Files larger than --max-mb (default 25) are skipped and reported.
 
-Every zip contains SNAPSHOT_INFO.txt: branch, commit, upstream ahead/behind (from the last fetch),
-uncommitted changes, and the full list of included and skipped files.
+File names say which branch the snapshot is of and number snapshots per branch:
+    <project>_<branch>_snapshot-<NNN>_<YYYY-MM-DD>_<HHMM>[_uncommitted][_<label>].zip
+    e.g. ML-Hackathon_stream-b-eval_snapshot-003_2026-11-26_1432_uncommitted.zip
+- <branch> is the current branch with "/" turned into "-" (detached HEAD -> detached-<sha>).
+- <NNN> is one more than the highest number already in the output folder for that branch, so
+  numbers count up per branch and are never reused, even if you delete an older zip.
+- The time is your local time; "_uncommitted" means the working tree had changes not yet committed.
+
+Every zip contains SNAPSHOT_INFO.txt: snapshot number, branch, commit, upstream ahead/behind (from
+the last fetch), uncommitted changes, and the full list of included and skipped files.
 
 Usage (from the repo root, plain Python 3.11+, no venv needed):
-    python scripts/snapshot.py                 # -> snapshots/<project>-<UTC time>-<sha>[-dirty].zip
+    python scripts/snapshot.py                 # -> snapshots/<project>_<branch>_snapshot-<NNN>_....zip
     python scripts/snapshot.py --dry-run       # list what would be included/skipped, write nothing
     python scripts/snapshot.py --out ~/Desktop --name before-merge
 """
@@ -184,10 +192,42 @@ def git_summary() -> dict[str, str]:
     return info
 
 
-def build_info(git: dict[str, str], sel: Selection, created: datetime) -> str:
+def _slug(text: str) -> str:
+    """File-name-safe version of `text` (anything outside [A-Za-z0-9._-] becomes '-')."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-") or "unnamed"
+
+
+def branch_label(git: dict[str, str]) -> str:
+    """Branch part of the file name: stream/b-eval -> stream-b-eval."""
+    if git["branch"] == "n/a":
+        return "no-git"
+    if git["branch"] == "HEAD":  # detached HEAD
+        return f"detached-{git['short']}"
+    return _slug(git["branch"])
+
+
+def next_number(out_dir: Path, project: str, branch: str) -> int:
+    """One more than the highest snapshot number already in `out_dir` for this project + branch."""
+    pattern = re.compile(rf"^{re.escape(project)}_{re.escape(branch)}_snapshot-(\d+)(?:_|\.zip$)")
+    numbers = [int(m.group(1)) for p in out_dir.glob("*.zip") if (m := pattern.match(p.name))]
+    return max(numbers, default=0) + 1
+
+
+def snapshot_stem(project: str, branch: str, number: int, when: datetime, dirty: bool, label: str | None) -> str:
+    parts = [project, branch, f"snapshot-{number:03d}", when.strftime("%Y-%m-%d_%H%M")]
+    if dirty:
+        parts.append("uncommitted")
+    if label:
+        parts.append(_slug(label))
+    return "_".join(parts)
+
+
+def build_info(git: dict[str, str], sel: Selection, created: datetime, number: int) -> str:
     lines = [
         "Project snapshot",
         "================",
+        f"Snapshot:        #{number} for branch {git['branch']}",
+        f"Created (local): {created.astimezone().isoformat(timespec='seconds')}",
         f"Created (UTC):   {created.isoformat(timespec='seconds')}",
         f"Branch:          {git['branch']}",
         f"Commit (HEAD):   {git['commit']}",
@@ -239,30 +279,29 @@ def main(argv: list[str] | None = None) -> int:
     git = git_summary()
     created = datetime.now(timezone.utc)
 
+    out_dir = Path(args.out).expanduser()
+    if not out_dir.is_absolute():
+        out_dir = REPO_ROOT / out_dir
+    project = _slug(REPO_ROOT.name)
+    branch = branch_label(git)
+    number = next_number(out_dir, project, branch)
+    stem = snapshot_stem(project, branch, number, created.astimezone(), git["dirty"] == "yes", args.name)
+    dest = out_dir / f"{stem}.zip"
+
     for p, why in sel.skipped:
         print(f"skip  {p}  [{why}]")
     if args.dry_run:
         for p in sel.included:
             print(f"keep  {p}")
         print(f"\n{len(sel.included)} files would be included, {len(sel.skipped)} skipped (dry run, nothing written)")
+        print(f"Would write: {dest.name}")
         return 0
 
-    project = re.sub(r"[^A-Za-z0-9._-]+", "-", REPO_ROOT.name)
-    parts = [project, created.strftime("%Y%m%d-%H%M%SZ"), git["short"]]
-    if git["dirty"] == "yes":
-        parts.append("dirty")
-    if args.name:
-        parts.append(re.sub(r"[^A-Za-z0-9._-]+", "-", args.name))
-    stem = "-".join(parts)
-    out_dir = Path(args.out).expanduser()
-    if not out_dir.is_absolute():
-        out_dir = REPO_ROOT / out_dir
-    dest = out_dir / f"{stem}.zip"
-
-    write_zip(dest, stem, sel, build_info(git, sel, created))
+    write_zip(dest, stem, sel, build_info(git, sel, created, number))
     size_mb = dest.stat().st_size / 1024 / 1024
     print(f"\nWrote {dest} ({size_mb:.2f} MB): {len(sel.included)} files included, {len(sel.skipped)} skipped.")
-    print(f"Branch {git['branch']} @ {git['short']}, uncommitted changes: {git['dirty']}, upstream: {git['ahead_behind']}")
+    print(f"Snapshot #{number} of branch {git['branch']} @ {git['short']}, uncommitted changes: {git['dirty']}, "
+          f"upstream: {git['ahead_behind']}")
     return 0
 
 

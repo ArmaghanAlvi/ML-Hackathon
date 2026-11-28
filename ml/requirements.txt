@@ -4,10 +4,13 @@ torch
 torchvision
 transformers
 huggingface_hub
+# NOTE: McAuley-Lab/Amazon-Reviews-2023 uses a loading script; datasets>=4 can't load it. Read the raw files (see reviews_prepare.py scan).
 datasets
 scikit-learn
 xgboost
 pandas
+pyarrow
+orjson
 numpy
 pillow
 imagehash

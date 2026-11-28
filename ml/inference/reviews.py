@@ -9,6 +9,15 @@ Stream B will replace it with the fine-tuned DistilBERT model (7c). Keep the int
 from __future__ import annotations
 
 
+def length_score(texts: list[str]) -> list[float]:
+    """Length heuristic: min(1, word_count / 100) per review, same length and order as `texts`.
+
+    Stream B's Stage 4b-i baseline, and the Stage 4e fallback when the trained model can't load.
+    `reviews_prepare.py scan` counts words the same way (`len((text or "").split())`).
+    """
+    return [min(1.0, len((t or "").split()) / 100) for t in texts]
+
+
 def score_reviews(texts: list[str]) -> list[float]:
     """Return P(helpful) per review, same length and order as `texts`, each in [0, 1]."""
-    return [min(1.0, len((t or "").split()) / 100.0) for t in texts]
+    return length_score(texts)
