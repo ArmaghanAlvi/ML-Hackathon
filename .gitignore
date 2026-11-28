@@ -26,6 +26,8 @@ ml/data/**
 
 # --- Local copies of Lens candidate images (shared as a zip, never committed) ---
 labeling/lens_cache/images/
+# Stream B: raw photos before EXIF/GPS stripping (never committed)
+labeling/queries/raw/
 
 # --- Backend response cache (raw SerpApi JSON) ---
 backend/app/cache/*.json
