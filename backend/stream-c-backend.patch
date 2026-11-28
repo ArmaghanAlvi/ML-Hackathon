@@ -1,0 +1,2757 @@
+diff --git a/.env.example b/.env.example
+index cc9ebe2..fc51f9d 100644
+--- a/.env.example
++++ b/.env.example
+@@ -6,3 +6,17 @@ CACHE_DIR=backend/app/cache
+ THRESHOLDS_PATH=ml/artifacts/thresholds.json
+ CORS_ORIGINS=http://localhost:5173
+ HF_MATCHER_REPO=
++
++# Stream C pipeline settings (defaults shown)
++SERPAPI_TIMEOUT_S=30
++SHOPPING_ENABLED=true
++SERP_GL=us
++SERP_HL=en
++MAX_LENS_CANDIDATES=20
++MAX_SHOPPING_CANDIDATES=10
++DETECTOR=none
++DETECTOR_WEIGHTS=yolo26n.pt
++CROP_PADDING=0.05
++IMAGE_FETCH_TIMEOUT_S=5
++IMAGE_FETCH_WORKERS=8
++MAX_IMAGE_BYTES=8000000
+diff --git a/.gitignore b/.gitignore
+index 1549169..f1c42ea 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -29,6 +29,11 @@ labeling/lens_cache/images/
+ 
+ # --- Backend response cache (raw SerpApi JSON) ---
+ backend/app/cache/*.json
++backend/app/cache/*.jsonl
++backend/app/cache/*.tmp
++backend/app/cache/images/
++spike_detect_out/
++backend/scripts/spike_results*.json
+ 
+ # --- Large artifacts / weights / media ---
+ *.pt
+diff --git a/backend/app/config.py b/backend/app/config.py
+index 5e0ba8a..2612659 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -21,6 +21,24 @@ class Settings(BaseSettings):
+     CORS_ORIGINS: str = "http://localhost:5173"  # comma-separated
+     HF_MATCHER_REPO: str = ""
+ 
++    # SerpApi (Stage 4b)
++    SERPAPI_TIMEOUT_S: float = 30.0      # Lens can take several seconds
++    SHOPPING_ENABLED: bool = True        # one extra search per new query (refinements reuse Lens)
++    SERP_GL: str = "us"                  # country
++    SERP_HL: str = "en"                  # language
++    MAX_LENS_CANDIDATES: int = 20
++    MAX_SHOPPING_CANDIDATES: int = 10
++
++    # Detection (Stage 4c); the CP1 decision goes in docs/decisions.md
++    DETECTOR: str = "none"               # "none" = whole image / user box, "yolo" = ultralytics
++    DETECTOR_WEIGHTS: str = "yolo26n.pt"
++    CROP_PADDING: float = 0.05           # fraction of the box size added on each side
++
++    # Image fetching (Stage 4d)
++    IMAGE_FETCH_TIMEOUT_S: float = 5.0
++    IMAGE_FETCH_WORKERS: int = 8
++    MAX_IMAGE_BYTES: int = 8_000_000     # per downloaded image and per base64 upload
++
+     @property
+     def cors_origins_list(self) -> list[str]:
+         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 51ec313..d7e651a 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI):
+ 
+ def create_app() -> FastAPI:
+     settings = get_settings()
+-    app = FastAPI(title="Product Compare API", version="0.1.0", lifespan=lifespan)
++    app = FastAPI(title="SnapShop API", version="0.1.0", lifespan=lifespan)
+ 
+     app.add_middleware(
+         CORSMiddleware,
+@@ -40,7 +40,8 @@ def create_app() -> FastAPI:
+ 
+     @app.get("/health")
+     def health() -> dict:
+-        return {"status": "ok", "mock": get_settings().USE_MOCK_RESPONSE}
++        s = get_settings()
++        return {"status": "ok", "mock": s.USE_MOCK_RESPONSE, "demo_cached": s.DEMO_CACHED}
+ 
+     app.include_router(search.router, prefix="/api")
+ 
+diff --git a/backend/app/routes/search.py b/backend/app/routes/search.py
+index e805a62..c7ed3c2 100644
+--- a/backend/app/routes/search.py
++++ b/backend/app/routes/search.py
+@@ -3,8 +3,17 @@
+ Owner: Stream C · Roadmap: Stage 4a (mock), Stage 4 (live pipeline)
+ Purpose: POST /api/search (contract C1).
+ 
+-STUB: the live pipeline is not implemented yet. With USE_MOCK_RESPONSE=true this returns the
+-canonical mock shared/mocks/search_response.json, validated as a SearchResponse.
++USE_MOCK_RESPONSE=true  -> the canonical mock shared/mocks/search_response.json.
++USE_MOCK_RESPONSE=false -> the live pipeline (backend/app/services/pipeline.py).
++
++Errors (detail = {"code": ..., "message": ...}) so the frontend can show the right state:
++  400 bad_image        image_base64 / image_url could not be read, or the URL is not allowed
++  503 cache_miss       DEMO_CACHED=true and this query was never cached
++  503 quota_exhausted  SerpApi is out of searches
++  503 no_api_key       SERPAPI_KEY is not set
++  502 upstream_error   SerpApi failed for another reason
++(422 for an invalid body is FastAPI's default.) The route is a plain `def`, so FastAPI runs it in
++a worker thread and the blocking SerpApi / image calls don't stall the server.
+ """
+ from __future__ import annotations
+ 
+@@ -15,6 +24,7 @@ from fastapi import APIRouter, HTTPException
+ 
+ from backend.app.config import get_settings
+ from backend.app.schemas import SearchRequest, SearchResponse
++from backend.app.services import images, pipeline, serp
+ 
+ REPO_ROOT = Path(__file__).resolve().parents[3]
+ MOCK_PATH = REPO_ROOT / "shared" / "mocks" / "search_response.json"
+@@ -26,9 +36,31 @@ def load_mock() -> SearchResponse:
+     return SearchResponse.model_validate(json.loads(MOCK_PATH.read_text()))
+ 
+ 
++def _err(status: int, code: str, e: Exception) -> HTTPException:
++    return HTTPException(status_code=status, detail={"code": code, "message": str(e)})
++
++
+ @router.post("/search", response_model=SearchResponse)
+ def search(req: SearchRequest) -> SearchResponse:
+     if get_settings().USE_MOCK_RESPONSE:
+         return load_mock()
+-    # TODO (Stage 4): detect -> serp (cached) -> matcher -> ranking -> reviews
+-    raise HTTPException(status_code=501, detail="live pipeline not implemented (Stream C, Stage 4)")
++    try:
++        return pipeline.run_search(req)
++    except images.OfflineCacheMiss as e:
++        raise _err(503, "cache_miss", e) from e
++    except images.ImageError as e:
++        raise _err(400, "bad_image", e) from e
++    except serp.CacheMiss as e:
++        raise _err(503, "cache_miss", e) from e
++    except serp.QuotaExhausted as e:
++        raise _err(503, "quota_exhausted", e) from e
++    except serp.MissingKey as e:
++        raise _err(503, "no_api_key", e) from e
++    except serp.SerpError as e:
++        raise _err(502, "upstream_error", e) from e
++
++
++@router.get("/quota")
++def quota() -> dict:
++    """Real SerpApi calls logged so far, per engine (cache hits are free and not counted)."""
++    return {"used": serp.quota_used(), "demo_cached": get_settings().DEMO_CACHED}
+diff --git a/backend/app/services/cache.py b/backend/app/services/cache.py
+index 98e2158..bac13f6 100644
+--- a/backend/app/services/cache.py
++++ b/backend/app/services/cache.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ 
+ import hashlib
+ import json
++import uuid
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -39,7 +40,7 @@ def save(key: str, data: dict[str, Any], cache_dir: str | Path | None = None) ->
+     """Write the raw response for `key` (atomic replace). Returns the file path."""
+     p = _path(key, cache_dir)
+     p.parent.mkdir(parents=True, exist_ok=True)
+-    tmp = p.with_suffix(".json.tmp")
++    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")  # unique per writer: concurrent requests
+     tmp.write_text(json.dumps(data), encoding="utf-8")
+     tmp.replace(p)
+     return p
+diff --git a/backend/app/services/detect.py b/backend/app/services/detect.py
+index 2a839ef..1c63633 100644
+--- a/backend/app/services/detect.py
++++ b/backend/app/services/detect.py
+@@ -4,15 +4,81 @@ Owner: Stream C · Roadmap: Stage 1b (detector test), 4c (service)
+ Purpose: return product boxes (normalized, contract C1 Box) for an image, or apply the CP1
+ fallback (whole image + user-drawn box). Detector choice is recorded in docs/decisions.md.
+ 
+-STUB: not implemented yet. Do not import ultralytics at module level.
++DETECTOR=none (default): no automatic boxes. The matcher and Lens use the user's box if they sent
++  one, otherwise the whole image. This is the fallback from roadmap 1b and needs no model.
++DETECTOR=yolo: ultralytics YOLO (weights from DETECTOR_WEIGHTS). ultralytics is imported lazily
++  inside the function, never at module level, and only if the team installed
++  backend/requirements-models.txt. If it is missing or fails, we fall back to no boxes.
++
++The crop (`crop_to_box`) is shared with Stream B's evaluation: the app and the real-photo eval
++must score the same crop, with the padding in CROP_PADDING (record it in docs/decisions.md).
+ """
+ from __future__ import annotations
+ 
++import logging
++from functools import lru_cache
++
+ from PIL import Image
+ 
++from backend.app.config import get_settings
+ from backend.app.schemas import Box
+ 
++log = logging.getLogger(__name__)
++
++# COCO classes that are never the product the user means.
++_IGNORE_LABELS = {"person", "dining table", "bed", "couch", "chair", "toilet", "car", "bus", "truck"}
++MIN_SCORE = 0.25
++
++
++@lru_cache(maxsize=1)
++def _load_yolo(weights: str):
++    from ultralytics import YOLO  # heavy: only when DETECTOR=yolo
++
++    return YOLO(weights)
++
++
++def _detect_yolo(image: Image.Image) -> list[Box]:
++    model = _load_yolo(get_settings().DETECTOR_WEIGHTS)
++    result = model.predict(image, verbose=False)[0]
++    names = result.names
++    boxes: list[Box] = []
++    for xyxyn, conf, cls in zip(result.boxes.xyxyn.tolist(), result.boxes.conf.tolist(),
++                                result.boxes.cls.tolist()):
++        label = names[int(cls)]
++        if conf < MIN_SCORE or label in _IGNORE_LABELS:
++            continue
++        x1, y1, x2, y2 = (min(max(v, 0.0), 1.0) for v in xyxyn)
++        if x2 - x1 <= 0 or y2 - y1 <= 0:
++            continue
++        boxes.append(Box(x=x1, y=y1, w=x2 - x1, h=y2 - y1, label=label, score=float(conf)))
++    return boxes
++
+ 
+ def detect(image: Image.Image) -> list[Box]:
+-    """Detect products in `image`; boxes sorted by score, highest first."""
+-    raise NotImplementedError("TODO: Stage 4c (detect)")
++    """Detect products in `image`; boxes sorted by score, highest first. [] = use the fallback."""
++    if get_settings().DETECTOR.lower() != "yolo":
++        return []
++    try:
++        boxes = _detect_yolo(image)
++    except Exception as e:  # noqa: BLE001 - detector trouble must never break search
++        log.warning("detector failed, using whole-image fallback: %s", e)
++        return []
++    return sorted(boxes, key=lambda b: b.score, reverse=True)
++
++
++def crop_to_box(image: Image.Image, box: Box | None, padding: float | None = None) -> Image.Image:
++    """Crop `image` to the normalized `box`, padded by `padding` x box size on each side
++    (clamped to the image). box=None returns the whole image."""
++    if box is None:
++        return image
++    pad = get_settings().CROP_PADDING if padding is None else padding
++    W, H = image.size
++    px, py = box.w * pad, box.h * pad
++    left = max(0.0, box.x - px) * W
++    top = max(0.0, box.y - py) * H
++    right = min(1.0, box.x + box.w + px) * W
++    bottom = min(1.0, box.y + box.h + py) * H
++    left, top = min(int(round(left)), W - 1), min(int(round(top)), H - 1)
++    right = min(max(left + 1, int(round(right))), W)
++    bottom = min(max(top + 1, int(round(bottom))), H)
++    return image.crop((left, top, right, bottom))
+diff --git a/backend/app/services/images.py b/backend/app/services/images.py
+new file mode 100644
+index 0000000..aa20171
+--- /dev/null
++++ b/backend/app/services/images.py
+@@ -0,0 +1,180 @@
++"""images.py
++
++Owner: Stream C · Roadmap: Stage 4d (candidate image fetching), 4g (cached mode), 9b (speed)
++Purpose: decode the user's image, and download candidate images safely, in parallel, with a disk
++cache so DEMO_CACHED mode can re-score without any network.
++
++Safety rules for URLs (suggestion 7): http(s) only, no private / loopback / link-local / reserved
++addresses (checked again on every redirect), a timeout, and a byte cap. Base64 uploads are capped.
++"""
++from __future__ import annotations
++
++import base64
++import binascii
++import hashlib
++import io
++import ipaddress
++import socket
++import uuid
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++from urllib.parse import urljoin, urlparse
++
++from PIL import Image, ImageOps, UnidentifiedImageError
++
++from backend.app.config import get_settings
++
++MAX_REDIRECTS = 3
++Image.MAX_IMAGE_PIXELS = 40_000_000  # refuse decompression bombs
++_USER_AGENT = "SnapShop/0.1 (hackathon project)"
++
++
++class ImageError(ValueError):
++    """The image could not be read (bad base64, not an image, too big)."""
++
++
++class UnsafeURLError(ImageError):
++    """The URL is not allowed (scheme, private address, ...)."""
++
++
++class OfflineCacheMiss(ImageError):
++    """DEMO_CACHED is on and this image URL was never cached."""
++
++
++# ---------------------------------------------------------------------------
++# Decoding
++# ---------------------------------------------------------------------------
++def decode_base64(data: str) -> bytes:
++    """Decode a base64 image (a data: URL prefix is allowed), enforcing MAX_IMAGE_BYTES."""
++    if "," in data and data.lstrip().startswith("data:"):
++        data = data.split(",", 1)[1]
++    max_bytes = get_settings().MAX_IMAGE_BYTES
++    if len(data) > (max_bytes * 4) // 3 + 4:
++        raise ImageError(f"image is larger than {max_bytes} bytes")
++    try:
++        return base64.b64decode(data, validate=False)
++    except (binascii.Error, ValueError) as e:
++        raise ImageError("image_base64 is not valid base64") from e
++
++
++def load_image(raw: bytes) -> Image.Image:
++    """Bytes -> RGB PIL image, with phone EXIF rotation applied."""
++    try:
++        img = Image.open(io.BytesIO(raw))
++        img = ImageOps.exif_transpose(img)
++        return img.convert("RGB")
++    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as e:
++        raise ImageError("could not read the image") from e
++
++
++def to_jpeg(img: Image.Image, max_bytes: int = 450_000, max_side: int = 1024) -> bytes:
++    """Encode as JPEG under `max_bytes` (SerpApi's upload limit is 500 KB), shrinking if needed."""
++    img = img.convert("RGB")
++    if max(img.size) > max_side:
++        img = img.copy()
++        img.thumbnail((max_side, max_side))
++    for quality in (90, 80, 70, 60, 50):
++        buf = io.BytesIO()
++        img.save(buf, format="JPEG", quality=quality)
++        if buf.tell() <= max_bytes:
++            return buf.getvalue()
++    img = img.copy()
++    img.thumbnail((max_side // 2, max_side // 2))
++    buf = io.BytesIO()
++    img.save(buf, format="JPEG", quality=60)
++    return buf.getvalue()
++
++
++# ---------------------------------------------------------------------------
++# URL safety
++# ---------------------------------------------------------------------------
++def _is_public_ip(ip: str) -> bool:
++    addr = ipaddress.ip_address(ip)
++    return not (
++        addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
++        or addr.is_multicast or addr.is_unspecified
++    )
++
++
++def check_url(url: str) -> None:
++    """Raise UnsafeURLError unless `url` is http(s) and every address it resolves to is public."""
++    parsed = urlparse(url)
++    if parsed.scheme not in ("http", "https"):
++        raise UnsafeURLError("only http(s) image URLs are allowed")
++    host = parsed.hostname
++    if not host:
++        raise UnsafeURLError("image URL has no host")
++    try:
++        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
++    except socket.gaierror as e:
++        raise UnsafeURLError(f"cannot resolve host {host}") from e
++    for info in infos:
++        if not _is_public_ip(info[4][0]):
++            raise UnsafeURLError("image URL points to a private or local address")
++
++
++# ---------------------------------------------------------------------------
++# Downloading (with disk cache)
++# ---------------------------------------------------------------------------
++def _image_cache_path(url: str) -> Path:
++    key = hashlib.sha256(url.encode("utf-8")).hexdigest()
++    return Path(get_settings().CACHE_DIR) / "images" / key
++
++
++def _download(url: str) -> bytes:
++    """GET with redirects checked by hand, a timeout and a byte cap. Patched out in tests."""
++    import httpx  # imported lazily so importing this module stays cheap
++
++    s = get_settings()
++    with httpx.Client(timeout=s.IMAGE_FETCH_TIMEOUT_S, follow_redirects=False,
++                      headers={"User-Agent": _USER_AGENT}) as client:
++        for _ in range(MAX_REDIRECTS + 1):
++            check_url(url)
++            with client.stream("GET", url) as r:
++                if r.is_redirect:
++                    url = urljoin(url, r.headers.get("location", ""))
++                    continue
++                r.raise_for_status()
++                buf = bytearray()
++                for chunk in r.iter_bytes():
++                    buf.extend(chunk)
++                    if len(buf) > s.MAX_IMAGE_BYTES:
++                        raise ImageError("downloaded image is too large")
++                return bytes(buf)
++    raise ImageError("too many redirects")
++
++
++def fetch_bytes(url: str) -> bytes:
++    """Image bytes for `url`: disk cache first; in DEMO_CACHED mode never touch the network."""
++    path = _image_cache_path(url)
++    if path.is_file():
++        return path.read_bytes()
++    if get_settings().DEMO_CACHED:
++        raise OfflineCacheMiss(f"image not cached: {url}")
++    data = _download(url)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")  # unique: threads may race
++    tmp.write_bytes(data)
++    tmp.replace(path)
++    return data
++
++
++def fetch_first_image(urls: list[str | None]) -> Image.Image | None:
++    """Try each URL in order (e.g. full-size image, then thumbnail); None if all fail."""
++    for url in urls:
++        if not url:
++            continue
++        try:
++            return load_image(fetch_bytes(url))
++        except Exception:  # noqa: BLE001 - any failure just means "try the next URL"
++            continue
++    return None
++
++
++def fetch_many(url_lists: list[list[str | None]]) -> list[Image.Image | None]:
++    """fetch_first_image for every candidate, in parallel threads. Order is preserved."""
++    if not url_lists:
++        return []
++    workers = max(1, min(get_settings().IMAGE_FETCH_WORKERS, len(url_lists)))
++    with ThreadPoolExecutor(max_workers=workers) as pool:
++        return list(pool.map(fetch_first_image, url_lists))
+diff --git a/backend/app/services/matcher.py b/backend/app/services/matcher.py
+index 3826ccd..88f382b 100644
+--- a/backend/app/services/matcher.py
++++ b/backend/app/services/matcher.py
+@@ -3,9 +3,12 @@
+ Owner: Stream C · Roadmap: Stage 4d
+ Purpose: thin wrapper around ml.inference.matcher.Matcher (contract C2). The matcher is loaded
+ once (at app startup via main.py's lifespan, or on first use) and reused for every request.
+-Swapping in Stream A's real model must not require changes here.
++Swapping in Stream A's real model must not require changes here: Stream A edits
++ml/inference/matcher.py and keeps the C2 interface; this file stays the same.
+ 
+-STUB: candidate image fetching is not implemented yet; scoring calls the C2 stub matcher.
++Candidate images are fetched in parallel (images.fetch_many), preferring Lens's full-size `image`
++over `thumbnail`, because small thumbnails hurt accuracy. A candidate whose image cannot be
++fetched gets score 0.0 and label "none" (it is still shown, just never ranked).
+ """
+ from __future__ import annotations
+ 
+@@ -14,6 +17,7 @@ from functools import lru_cache
+ from PIL import Image
+ 
+ from backend.app.config import get_settings
++from backend.app.services import images
+ from ml.inference.matcher import Matcher
+ 
+ 
+@@ -28,3 +32,21 @@ def score_candidates(query: Image.Image, candidates: list[Image.Image]) -> tuple
+     m = get_matcher()
+     scores = m.score(query, candidates)
+     return scores, m.label(scores)
++
++
++def score_candidate_urls(query: Image.Image, url_lists: list[list[str | None]]
++                         ) -> tuple[list[float], list[str], int]:
++    """Fetch each candidate's image (first URL that works, in parallel) and score it.
++
++    Returns (scores, labels, n_failed), aligned with `url_lists`.
++    """
++    fetched = images.fetch_many(url_lists)
++    ok_idx = [i for i, im in enumerate(fetched) if im is not None]
++    scores = [0.0] * len(url_lists)
++    labels = ["none"] * len(url_lists)
++    if ok_idx:
++        s, lab = score_candidates(query, [fetched[i] for i in ok_idx])
++        for j, i in enumerate(ok_idx):
++            scores[i] = float(min(max(s[j], 0.0), 1.0))
++            labels[i] = lab[j]
++    return scores, labels, len(url_lists) - len(ok_idx)
+diff --git a/backend/app/services/pipeline.py b/backend/app/services/pipeline.py
+new file mode 100644
+index 0000000..10aebcc
+--- /dev/null
++++ b/backend/app/services/pipeline.py
+@@ -0,0 +1,216 @@
++"""pipeline.py
++
++Owner: Stream C · Roadmap: Stage 4 (live /api/search), 4f (text refinement), 4g (cached mode)
++Purpose: the live search pipeline, kept separate from the FastAPI route so it can be tested
++without a web server:
++
++    image -> detect -> crop -> Lens (serp.py, cached) -> Shopping on the top title + refinement
++          -> fetch candidate images in parallel -> matcher scores + labels -> C7 ranking
++          -> SearchResponse (contract C1)
++
++Notes
++- Candidates come from both Lens visual matches and Shopping results, de-duplicated by link.
++- Only USD prices enter the ranking pool (suggestion 9). Other currencies are still shown.
++- A used/refurbished condition from SerpApi goes into `description` (no contract change needed).
++- A refinement on the same photo re-uses the cached Lens result, so it only costs a Shopping search.
++- Reviews (trust_rating, top_reviews) are Stage 7e and stay empty for now.
++"""
++from __future__ import annotations
++
++import hashlib
++import logging
++import time
++from typing import Any
++
++from backend.app.config import get_settings
++from backend.app.schemas import Box, Candidate, SearchRequest, SearchResponse
++from backend.app.services import detect, images, ranking, serp
++from backend.app.services import matcher as matcher_service
++
++log = logging.getLogger(__name__)
++
++_CURRENCY = {"$": "USD", "US$": "USD", "€": "EUR", "£": "GBP", "₹": "INR", "¥": "JPY", "C$": "CAD", "A$": "AUD"}
++_LABEL_ORDER = {"identical": 0, "similar": 1, "none": 2}
++MAX_QUERY_CHARS = 100
++
++
++def _currency(symbol_or_price: Any) -> str:
++    s = str(symbol_or_price or "").strip()
++    if not s:
++        return "USD"
++    if s.upper() in {"USD", "EUR", "GBP", "INR", "JPY", "CAD", "AUD"}:
++        return s.upper()
++    for sym in sorted(_CURRENCY, key=len, reverse=True):
++        if s.startswith(sym):
++            return _CURRENCY[sym]
++    return s[:3].upper()
++
++
++def _num(v: Any) -> float | None:
++    try:
++        return float(v) if v is not None else None
++    except (TypeError, ValueError):
++        return None
++
++
++def _int(v: Any) -> int | None:
++    f = _num(v)
++    return int(f) if f is not None and f >= 0 else None
++
++
++def _rating(v: Any) -> float | None:
++    f = _num(v)
++    return f if f is not None and 0 <= f <= 5 else None
++
++
++def parse_lens(raw: dict[str, Any], limit: int) -> list[dict[str, Any]]:
++    """Lens visual_matches -> internal candidate dicts (plus `_urls` to fetch for matching)."""
++    out = []
++    for i, m in enumerate((raw.get("visual_matches") or [])[:limit]):
++        link, image = m.get("link"), m.get("image") or m.get("thumbnail")
++        if not link or not image or not m.get("title"):
++            continue
++        price = m.get("price") or {}
++        out.append({
++            "id": f"l{m.get('position', i + 1)}",
++            "title": m["title"],
++            "description": m.get("condition"),
++            "price": _num(price.get("extracted_value")) if isinstance(price, dict) else None,
++            "currency": _currency(price.get("currency") if isinstance(price, dict) else None),
++            "rating": _rating(m.get("rating")),
++            "review_count": _int(m.get("reviews")),
++            "source": m.get("source") or "Unknown",
++            "link": link,
++            "image_url": image,
++            "_urls": [m.get("image"), m.get("thumbnail")],
++        })
++    return out
++
++
++def parse_shopping(raw: dict[str, Any], limit: int) -> list[dict[str, Any]]:
++    """Shopping shopping_results -> internal candidate dicts."""
++    out = []
++    for i, r in enumerate((raw.get("shopping_results") or [])[:limit]):
++        link = r.get("product_link") or r.get("link")
++        image = r.get("thumbnail") or r.get("serpapi_thumbnail")
++        if not link or not image or not r.get("title"):
++            continue
++        cond = r.get("second_hand_condition")
++        out.append({
++            "id": f"s{r.get('position', i + 1)}",
++            "title": r["title"],
++            "description": f"Condition: {cond}" if cond else (r.get("snippet") or None),
++            "price": _num(r.get("extracted_price")),
++            "currency": _currency(r.get("price")),
++            "rating": _rating(r.get("rating")),
++            "review_count": _int(r.get("reviews")),
++            "source": r.get("source") or "Unknown",
++            "link": link,
++            "image_url": image,
++            "_urls": [r.get("thumbnail"), r.get("serpapi_thumbnail")],
++        })
++    return out
++
++
++def _dedupe(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    seen, out = set(), []
++    for c in cands:
++        if c["link"] in seen:
++            continue
++        seen.add(c["link"])
++        out.append(c)
++    return out
++
++
++def shopping_query(lens_raw: dict[str, Any], text: str | None) -> str | None:
++    """Top Lens title (+ the user's refinement text), or the text alone if Lens found nothing."""
++    vm = lens_raw.get("visual_matches") or []
++    title = (vm[0].get("title") or "") if vm else ""
++    title = title[:MAX_QUERY_CHARS].rsplit(" ", 1)[0] if len(title) > MAX_QUERY_CHARS else title
++    q = " ".join(p for p in (title, (text or "").strip()) if p)
++    return q or None
++
++
++def run_search(req: SearchRequest) -> SearchResponse:
++    s = get_settings()
++    timings: dict[str, float] = {}
++    t_all = time.perf_counter()
++
++    def lap(name: str, t0: float) -> None:
++        timings[name] = round((time.perf_counter() - t0) * 1000, 1)
++
++    # 1. Image in
++    t0 = time.perf_counter()
++    raw = images.decode_base64(req.image_base64) if req.image_base64 is not None else images.fetch_bytes(req.image_url)
++    img = images.load_image(raw)
++    lap("decode", t0)
++
++    # 2. Detection + crop
++    t0 = time.perf_counter()
++    detections = detect.detect(img)
++    selected: Box | None = req.box or (detections[0] if detections else None)
++    crop = detect.crop_to_box(img, selected)
++    lap("detect", t0)
++
++    # 3. Lens (URL flow when there is no crop and we were given a URL, else upload the crop)
++    t0 = time.perf_counter()
++    metas: list[dict] = []
++    lens_meta: dict = {}
++    if selected is None and req.image_url is not None:
++        lens_raw = serp.lens_search(image_url=req.image_url, meta=lens_meta)
++        lens_key = req.image_url
++    else:
++        jpeg = images.to_jpeg(crop)
++        lens_raw = serp.lens_search(image_bytes=jpeg, meta=lens_meta)
++        lens_key = hashlib.sha256(jpeg).hexdigest()
++    metas.append(lens_meta)
++    lap("lens", t0)
++
++    # 4. Shopping on the top title + refinement (4f)
++    t0 = time.perf_counter()
++    shop_raw: dict[str, Any] = {}
++    q = shopping_query(lens_raw, req.text)
++    if s.SHOPPING_ENABLED and q:
++        shop_meta: dict = {}
++        shop_raw = serp.shopping_search(q, meta=shop_meta)
++        metas.append(shop_meta)
++    lap("shopping", t0)
++
++    cands = _dedupe(parse_lens(lens_raw, s.MAX_LENS_CANDIDATES)
++                    + parse_shopping(shop_raw, s.MAX_SHOPPING_CANDIDATES))
++
++    # 5. Match: fetch images in parallel, score against the crop
++    t0 = time.perf_counter()
++    scores, labels, n_failed = matcher_service.score_candidate_urls(crop, [c["_urls"] for c in cands])
++    for c, sc, lab in zip(cands, scores, labels):
++        c["match_score"], c["match_label"] = sc, lab
++    lap("match", t0)
++    if n_failed:
++        log.info("%d of %d candidate images could not be fetched", n_failed, len(cands))
++
++    # 6. Rank (C7) over USD-priced identical/similar candidates
++    t0 = time.perf_counter()
++    rank_in = [c for c in cands if c["currency"] == "USD"]
++    lists = ranking.top_k_lists(rank_in)
++    for c in cands:
++        adj = lists["adjusted_rating"].get(c["id"])
++        c["adjusted_rating"] = None if adj is None else min(max(adj, 0.0), 5.0)
++    lap("rank", t0)
++
++    cands.sort(key=lambda c: (_LABEL_ORDER[c["match_label"]], -c["match_score"]))
++    candidates = [Candidate(**{k: v for k, v in c.items() if not k.startswith("_")}) for c in cands]
++    timings["total"] = round((time.perf_counter() - t_all) * 1000, 1)
++
++    qid = hashlib.sha256(f"{lens_key}|{(req.text or '').strip()}".encode()).hexdigest()[:16]
++    return SearchResponse(
++        query_id=qid,
++        detections=detections,
++        selected_box=selected,
++        candidates=candidates,
++        top_cheapest=lists["top_cheapest"],
++        top_rated=lists["top_rated"],
++        best_value=lists["best_value"],
++        frontier=lists["frontier"],
++        cached=all(m.get("cached") for m in metas),
++        timings_ms=timings,
++    )
+diff --git a/backend/app/services/ranking.py b/backend/app/services/ranking.py
+index ccec12d..a7ef7d7 100644
+--- a/backend/app/services/ranking.py
++++ b/backend/app/services/ranking.py
+@@ -4,17 +4,45 @@ Owner: Stream C · Roadmap: Stage 4e
+ Purpose: adjusted (Bayesian) rating, Pareto frontier, weighted best value, and the top-3 lists.
+ Must pass shared/ranking_test_vectors.json (same vectors as frontend/src/lib/ranking.ts).
+ 
+-Pool: candidates with match_label in {identical, similar}, non-null price, and (for rating-based
+-lists) non-null rating.
++Pool: candidates with match_label in {identical, similar} (a missing match_label counts as in the
++pool, which is how the test vectors are written), a price > 0, and (for rating-based lists) a
++non-null rating.
+ 
+-STUB: not implemented yet.
++Interpretation choices the spec leaves open (proposed for docs/decisions.md, so D matches them):
++- "Rated pool" = pool members with a non-null rating. C and m are computed over the rated pool;
++  adjusted_rating, top_rated, frontier and best_value only contain rated-pool ids.
++- top_cheapest uses every pool member, rated or not.
++- m = statistical median of review counts (null -> 0; even count -> mean of the middle two), min 1.
++- Ties: top_cheapest -> lower price, then input order. top_rated -> higher adj, then higher
++  review count, then input order. best_value -> higher score, then input order.
++- Prices <= 0 are left out of the pool (log(price) is undefined there).
+ """
+ from __future__ import annotations
+ 
++import math
++from statistics import median
+ from typing import Any
+ 
+ Cand = dict[str, Any]  # needs at least: id, price, rating, review_count
+ 
++POOL_LABELS = {"identical", "similar"}
++
++
++def _in_pool(c: Cand) -> bool:
++    label = c.get("match_label")
++    if label is not None and label not in POOL_LABELS:
++        return False
++    price = c.get("price")
++    return price is not None and price > 0
++
++
++def _rated(candidates: list[Cand]) -> list[Cand]:
++    return [c for c in candidates if _in_pool(c) and c.get("rating") is not None]
++
++
++def _votes(c: Cand) -> int:
++    return int(c.get("review_count") or 0)
++
+ 
+ def bayesian_average(candidates: list[Cand]) -> dict[str, float]:
+     """adj = (v/(v+m))*R + (m/(v+m))*C per candidate id.
+@@ -22,19 +50,58 @@ def bayesian_average(candidates: list[Cand]) -> dict[str, float]:
+     R = candidate rating, v = review_count (None -> 0), C = mean rating of the pool,
+     m = median review count of the pool (minimum 1).
+     """
+-    raise NotImplementedError("TODO: Stage 4e (bayesian_average)")
++    rated = _rated(candidates)
++    if not rated:
++        return {}
++    C = sum(float(c["rating"]) for c in rated) / len(rated)
++    m = max(1.0, float(median(_votes(c) for c in rated)))
++    out: dict[str, float] = {}
++    for c in rated:
++        v = _votes(c)
++        R = float(c["rating"])
++        out[c["id"]] = (v / (v + m)) * R + (m / (v + m)) * C
++    return out
+ 
+ 
+ def pareto_frontier(candidates: list[Cand], adjusted: dict[str, float]) -> list[str]:
+     """Ids not dominated by any other. A dominates B if price_A <= price_B and adj_A >= adj_B,
+     with at least one strict."""
+-    raise NotImplementedError("TODO: Stage 4e (pareto_frontier)")
++    rated = [c for c in _rated(candidates) if c["id"] in adjusted]
++    frontier: list[str] = []
++    for b in rated:
++        pb, ab = float(b["price"]), adjusted[b["id"]]
++        dominated = False
++        for a in rated:
++            if a is b:
++                continue
++            pa, aa = float(a["price"]), adjusted[a["id"]]
++            if pa <= pb and aa >= ab and (pa < pb or aa > ab):
++                dominated = True
++                break
++        if not dominated:
++            frontier.append(b["id"])
++    return frontier
++
++
++def _minmax(values: dict[str, float]) -> dict[str, float]:
++    if not values:
++        return {}
++    lo, hi = min(values.values()), max(values.values())
++    if hi == lo:
++        return {k: 0.5 for k in values}
++    return {k: (v - lo) / (hi - lo) for k, v in values.items()}
+ 
+ 
+ def weighted_value(candidates: list[Cand], adjusted: dict[str, float], weight: float = 0.5) -> dict[str, float]:
+     """score = w*norm(adj) + (1-w)*(1 - norm(log(price))); norm = min-max over the pool,
+     0.5 if all values are equal. Default w = 0.5."""
+-    raise NotImplementedError("TODO: Stage 4e (weighted_value)")
++    rated = [c for c in _rated(candidates) if c["id"] in adjusted]
++    n_adj = _minmax({c["id"]: adjusted[c["id"]] for c in rated})
++    n_logp = _minmax({c["id"]: math.log(float(c["price"])) for c in rated})
++    return {
++        c["id"]: weight * n_adj[c["id"]] + (1 - weight) * (1 - n_logp[c["id"]])
++        for c in rated
++    }
+ 
+ 
+ def top_k_lists(candidates: list[Cand], weight: float = 0.5, k: int = 3) -> dict[str, Any]:
+@@ -43,4 +110,19 @@ def top_k_lists(candidates: list[Cand], weight: float = 0.5, k: int = 3) -> dict
+     top_cheapest: k lowest prices. top_rated: k highest adj, ties -> higher review_count.
+     best_value: k highest weighted_value.
+     """
+-    raise NotImplementedError("TODO: Stage 4e (top_k_lists)")
++    pool = [(i, c) for i, c in enumerate(candidates) if _in_pool(c)]
++    rated = [(i, c) for i, c in pool if c.get("rating") is not None]
++    adjusted = bayesian_average(candidates)
++    values = weighted_value(candidates, adjusted, weight)
++
++    cheapest = sorted(pool, key=lambda t: (float(t[1]["price"]), t[0]))
++    top_rated = sorted(rated, key=lambda t: (-adjusted[t[1]["id"]], -_votes(t[1]), t[0]))
++    best = sorted(rated, key=lambda t: (-values[t[1]["id"]], t[0]))
++
++    return {
++        "adjusted_rating": adjusted,
++        "top_cheapest": [c["id"] for _, c in cheapest[:k]],
++        "top_rated": [c["id"] for _, c in top_rated[:k]],
++        "frontier": pareto_frontier(candidates, adjusted),
++        "best_value": [c["id"] for _, c in best[:k]],
++    }
+diff --git a/backend/app/services/reviews.py b/backend/app/services/reviews.py
+index bfd4f23..5dbb7fc 100644
+--- a/backend/app/services/reviews.py
++++ b/backend/app/services/reviews.py
+@@ -5,7 +5,8 @@ Purpose: wrap ml.inference.reviews.score_reviews (contract C3). Later: fetch rev
+ few products only (cached via serp.py/cache.py), compute trust_rating and pick the 2-3 most
+ informative reviews per card.
+ 
+-STUB: review fetching and trust_rating are not implemented yet; scoring calls the C3 stub.
++STUB: review fetching is not implemented yet (Stage 7e, Tue 12/1). trust_rating below is the
++placeholder formula from this docstring; swap in Stream B's formula once it is in docs/decisions.md.
+ """
+ from __future__ import annotations
+ 
+@@ -18,5 +19,18 @@ def score(texts: list[str]) -> list[float]:
+ 
+ 
+ def trust_rating(ratings: list[float], texts: list[str]) -> float | None:
+-    """Helpfulness-weighted mean rating for one product."""
+-    raise NotImplementedError("TODO: Stage 7e (trust_rating)")
++    """Helpfulness-weighted mean rating for one product.
++
++    trust = sum(h_i * r_i) / sum(h_i), where h_i = P(helpful) of review i from score_reviews.
++    Returns None if there are no reviews or every helpfulness weight is 0.
++    """
++    if len(ratings) != len(texts):
++        raise ValueError("ratings and texts must have the same length")
++    if not ratings:
++        return None
++    weights = score(texts)
++    total = sum(weights)
++    if total <= 0:
++        return None
++    value = sum(w * r for w, r in zip(weights, ratings)) / total
++    return min(max(value, 0.0), 5.0)
+diff --git a/backend/app/services/serp.py b/backend/app/services/serp.py
+index c17b75a..6865e2b 100644
+--- a/backend/app/services/serp.py
++++ b/backend/app/services/serp.py
+@@ -6,22 +6,233 @@ Purpose: the ONLY place that calls SerpApi (Google Lens + Google Shopping).
+ Rules (see CLAUDE.md quota rule):
+ - Every call goes through cache.py: compute cache_key, return cache.load() on a hit, otherwise
+   call SerpApi (httpx, with timeouts), cache.save() the RAW response, and return it.
+-- Every real call logs quota use (engine, key, timestamp).
+-- With DEMO_CACHED=true, never call the network: a cache miss is an error.
+-- Tests must never reach this network path.
++- Every real call logs quota use (engine, key, timestamp) to <CACHE_DIR>/quota_log.jsonl.
++- With DEMO_CACHED=true, never call the network: a cache miss raises CacheMiss.
++- Tests must never reach this network path (they patch _http_get / _http_upload).
+ 
+-STUB: not implemented yet.
++Cache keys (contract C4: sha256(image_bytes + engine + text)):
++- Lens, upload flow: the image bytes you pass in (before any re-encoding), engine "google_lens".
++- Lens, URL flow:    the URL's UTF-8 bytes stand in for the image bytes.
++- Shopping:          empty image bytes, engine "google_shopping", text = the full query string.
++
++Lens upload flow: POST the image to SerpApi's Image API (max 500 KB, so we re-encode to JPEG
++first), get an image_id, then run google_lens with image_id. Searches per new user query:
++1 Lens + 1 Shopping (+ the upload). A text refinement on the same photo re-uses the cached Lens
++result, so it costs only 1 Shopping search.
+ """
+ from __future__ import annotations
+ 
++import json
++import time
++from datetime import datetime, timezone
++from pathlib import Path
+ from typing import Any
+ 
++from backend.app.config import get_settings
++from backend.app.services import cache
++
++SEARCH_URL = "https://serpapi.com/search.json"
++UPLOAD_URL = "https://serpapi.com/image"
++ENGINE_LENS = "google_lens"
++ENGINE_SHOPPING = "google_shopping"
++UPLOAD_MAX_BYTES = 450_000  # SerpApi limit is 500 KB; keep a margin
++
++# SerpApi puts these in the "error" field when a search simply had no results. That is a
++# valid (empty) answer, so it is cached instead of raised.
++_NO_RESULT_ERRORS = ("hasn't returned any results", "has not returned any results", "no results")
++_QUOTA_ERRORS = ("run out of searches", "out of searches", "plan searches", "rate limit")
++
++
++class SerpError(RuntimeError):
++    """SerpApi failed (network, HTTP error, or an error message in the JSON)."""
++
++
++class QuotaExhausted(SerpError):
++    """The SerpApi account is out of searches (or rate limited)."""
++
++
++class CacheMiss(SerpError):
++    """DEMO_CACHED=true and this query was never cached."""
++
++
++class MissingKey(SerpError):
++    """SERPAPI_KEY is not set."""
++
++
++# ---------------------------------------------------------------------------
++# HTTP layer (patched in tests; nothing else in the codebase calls SerpApi)
++# ---------------------------------------------------------------------------
++def _http_get(params: dict[str, Any]) -> tuple[int, dict[str, Any]]:
++    import httpx
++
++    timeout = httpx.Timeout(get_settings().SERPAPI_TIMEOUT_S, connect=5.0)
++    try:
++        r = httpx.get(SEARCH_URL, params=params, timeout=timeout)
++    except httpx.HTTPError as e:
++        raise SerpError(f"SerpApi request failed: {e}") from e
++    try:
++        body = r.json()
++    except ValueError:
++        body = {"error": r.text[:300]}
++    return r.status_code, body
++
++
++def _http_upload(jpeg: bytes, api_key: str) -> tuple[int, dict[str, Any]]:
++    import httpx
++
++    timeout = httpx.Timeout(get_settings().SERPAPI_TIMEOUT_S, connect=5.0)
++    try:
++        r = httpx.post(
++            UPLOAD_URL,
++            data={"api_key": api_key},
++            files={"image": ("query.jpg", jpeg, "image/jpeg")},
++            timeout=timeout,
++        )
++    except httpx.HTTPError as e:
++        raise SerpError(f"SerpApi image upload failed: {e}") from e
++    try:
++        body = r.json()
++    except ValueError:
++        body = {"error": r.text[:300]}
++    return r.status_code, body
++
++
++# ---------------------------------------------------------------------------
++# Quota log
++# ---------------------------------------------------------------------------
++def _quota_log_path() -> Path:
++    return Path(get_settings().CACHE_DIR) / "quota_log.jsonl"
++
++
++def _log_call(engine: str, key: str, ok: bool, latency_ms: float, note: str = "") -> None:
++    p = _quota_log_path()
++    p.parent.mkdir(parents=True, exist_ok=True)
++    row = {
++        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
++        "engine": engine,
++        "key": key,
++        "ok": ok,
++        "latency_ms": round(latency_ms, 1),
++    }
++    if note:
++        row["note"] = note
++    with p.open("a", encoding="utf-8") as f:
++        f.write(json.dumps(row) + "\n")
++
++
++def quota_used() -> dict[str, int]:
++    """Count of logged real (non-cached) calls per engine, from the quota log."""
++    p = _quota_log_path()
++    counts: dict[str, int] = {}
++    if not p.is_file():
++        return counts
++    for line in p.read_text(encoding="utf-8").splitlines():
++        try:
++            engine = json.loads(line)["engine"]
++        except (ValueError, KeyError):
++            continue
++        counts[engine] = counts.get(engine, 0) + 1
++    return counts
++
++
++# ---------------------------------------------------------------------------
++# Core
++# ---------------------------------------------------------------------------
++def _api_key() -> str:
++    key = get_settings().SERPAPI_KEY
++    if not key:
++        raise MissingKey("SERPAPI_KEY is not set (copy .env.example to .env and fill it in)")
++    return key
++
++
++def _check_body(status: int, body: dict[str, Any]) -> bool:
++    """Raise on failures. Returns True if the body is a cacheable answer."""
++    err = str(body.get("error") or "")
++    low = err.lower()
++    if status == 429 or any(s in low for s in _QUOTA_ERRORS):
++        raise QuotaExhausted(err or "SerpApi rate limit / quota exhausted")
++    if err and any(s in low for s in _NO_RESULT_ERRORS):
++        return True
++    if status >= 400 or err:
++        raise SerpError(err or f"SerpApi HTTP {status}")
++    return True
++
++
++def _cached_search(key: str, engine: str, params: dict[str, Any], meta: dict | None,
++                   prepare=None) -> dict[str, Any]:
++    """Cache lookup, then (if allowed) a real call. `prepare()` may add params (e.g. image_id)."""
++    hit = cache.load(key)
++    if hit is not None:
++        if meta is not None:
++            meta["cached"] = True
++        return hit
++    if get_settings().DEMO_CACHED:
++        raise CacheMiss(f"DEMO_CACHED is on and {engine} result {key[:12]}… is not cached")
++
++    api_key = _api_key()
++    if prepare is not None:
++        params = {**params, **prepare(api_key)}
++    params = {**params, "engine": engine, "api_key": api_key}
++
++    t0 = time.perf_counter()
++    try:
++        status, body = _http_get(params)
++        _check_body(status, body)
++    except SerpError as e:
++        _log_call(engine, key, ok=False, latency_ms=(time.perf_counter() - t0) * 1000, note=str(e)[:200])
++        raise
++    _log_call(engine, key, ok=True, latency_ms=(time.perf_counter() - t0) * 1000)
++    cache.save(key, body)
++    if meta is not None:
++        meta["cached"] = False
++    return body
++
++
++def _shrink_for_upload(image_bytes: bytes) -> bytes:
++    if len(image_bytes) <= UPLOAD_MAX_BYTES and image_bytes[:3] == b"\xff\xd8\xff":
++        return image_bytes
++    from backend.app.services.images import load_image, to_jpeg
++
++    return to_jpeg(load_image(image_bytes), max_bytes=UPLOAD_MAX_BYTES)
++
++
++def _upload(image_bytes: bytes, api_key: str) -> dict[str, Any]:
++    jpeg = _shrink_for_upload(image_bytes)
++    t0 = time.perf_counter()
++    status, body = _http_upload(jpeg, api_key)
++    image_id = body.get("image_id")
++    ok = status < 400 and bool(image_id)
++    _log_call("image_upload", "", ok=ok, latency_ms=(time.perf_counter() - t0) * 1000,
++              note="" if ok else str(body.get("error", status))[:200])
++    if not ok:
++        _check_body(status, body)  # raises QuotaExhausted / SerpError when there is an error
++        raise SerpError("SerpApi image upload returned no image_id")
++    return {"image_id": image_id}
++
++
++def lens_search(image_url: str | None = None, image_bytes: bytes | None = None,
++                *, meta: dict | None = None) -> dict[str, Any]:
++    """Google Lens visual search by URL or uploaded bytes. Returns the raw SerpApi JSON (cached, C4).
+ 
+-def lens_search(image_url: str | None = None, image_bytes: bytes | None = None) -> dict[str, Any]:
+-    """Google Lens visual search by URL or uploaded bytes. Returns the raw SerpApi JSON (cached, C4)."""
+-    raise NotImplementedError("TODO: Stage 4b (serp.lens_search)")
++    Pass exactly one of `image_url` / `image_bytes`. If `meta` is a dict, meta["cached"] is set.
++    """
++    if (image_url is None) == (image_bytes is None):
++        raise ValueError("pass exactly one of image_url or image_bytes")
++    s = get_settings()
++    params: dict[str, Any] = {"hl": s.SERP_HL, "country": s.SERP_GL}
++    if image_url is not None:
++        key = cache.cache_key(image_url.encode("utf-8"), ENGINE_LENS, None)
++        return _cached_search(key, ENGINE_LENS, {**params, "url": image_url}, meta)
++    key = cache.cache_key(image_bytes, ENGINE_LENS, None)
++    return _cached_search(key, ENGINE_LENS, params, meta,
++                          prepare=lambda api_key: _upload(image_bytes, api_key))
+ 
+ 
+-def shopping_search(query: str) -> dict[str, Any]:
++def shopping_search(query: str, *, meta: dict | None = None) -> dict[str, Any]:
+     """Google Shopping search on the top match title (+ text refinement). Raw SerpApi JSON (cached, C4)."""
+-    raise NotImplementedError("TODO: Stage 4b (serp.shopping_search)")
++    query = " ".join(query.split())
++    if not query:
++        raise ValueError("empty shopping query")
++    s = get_settings()
++    key = cache.cache_key(b"", ENGINE_SHOPPING, query)
++    return _cached_search(key, ENGINE_SHOPPING, {"q": query, "gl": s.SERP_GL, "hl": s.SERP_HL}, meta)
+diff --git a/backend/scripts/spike_detect.py b/backend/scripts/spike_detect.py
+new file mode 100644
+index 0000000..6be40ac
+--- /dev/null
++++ b/backend/scripts/spike_detect.py
+@@ -0,0 +1,52 @@
++"""spike_detect.py
++
++Owner: Stream C · Roadmap: Stage 1b (detector test)
++Purpose: run a YOLO detector on ~10 demo photos and save annotated copies, so the team can pick
++DETECTOR=yolo or the fallback (whole image + user drags a box) at CP1.
++
++Needs the heavy deps (NOT installed by default):
++    pip install -r backend/requirements-models.txt
++Usage (repo root):
++    python backend/scripts/spike_detect.py photos/*.jpg --weights yolo26n.pt --out spike_detect_out
++    python backend/scripts/spike_detect.py photos/*.jpg --weights yoloe-11s-seg.pt --prompt product
++For each photo it prints the boxes (label, confidence) and the time taken. Judge: is the demo
++object boxed, as the top box, in most photos? If not, use the fallback.
++"""
++from __future__ import annotations
++
++import argparse
++import time
++from pathlib import Path
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    ap.add_argument("images", nargs="+")
++    ap.add_argument("--weights", default="yolo26n.pt")
++    ap.add_argument("--prompt", action="append", help="Open-vocabulary class prompt (YOLOE models only)")
++    ap.add_argument("--out", default="spike_detect_out")
++    args = ap.parse_args()
++
++    from ultralytics import YOLO
++
++    model = YOLO(args.weights)
++    if args.prompt:
++        model.set_classes(args.prompt)  # YOLOE; recent ultralytics versions may need text embeddings
++    out = Path(args.out)
++    out.mkdir(parents=True, exist_ok=True)
++
++    hits = 0
++    for path in args.images:
++        t0 = time.perf_counter()
++        res = model.predict(path, verbose=False)[0]
++        ms = (time.perf_counter() - t0) * 1000
++        boxes = [(res.names[int(c)], round(float(p), 2))
++                 for c, p in zip(res.boxes.cls.tolist(), res.boxes.conf.tolist())]
++        hits += bool(boxes)
++        print(f"{path}: {ms:.0f} ms  {boxes[:5]}")
++        res.save(filename=str(out / Path(path).name))
++    print(f"\n{hits}/{len(args.images)} photos had at least one box. Annotated copies in {out}/")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/backend/scripts/spike_serp.py b/backend/scripts/spike_serp.py
+index d34ccdf..c754a26 100644
+--- a/backend/scripts/spike_serp.py
++++ b/backend/scripts/spike_serp.py
+@@ -1,34 +1,110 @@
+ """spike_serp.py
+ 
+ Owner: Stream C · Roadmap: Stage 1a (feasibility test)
+-Purpose: throwaway SerpApi test. Run Google Lens on an image URL (and the upload flow), then
+-Google Shopping on the top match title. Record latency, rating/review coverage, result counts and
+-searches per user query; save raw JSON to the cache (C4).
++Purpose: SerpApi test. Run Google Lens on images (URL flow and/or upload flow), then Google
++Shopping on the top match title. Records latency, rating/review/price coverage, result counts and
++searches per user query; raw JSON is saved to the cache (C4) through serp.py, so re-running the
++same images costs nothing.
+ 
+-Usage: python backend/scripts/spike_serp.py --image-url https://... [--query "..."]
+-Reads SERPAPI_KEY from the environment. Uses real quota: run by hand only, never in tests.
++Usage (from the repo root, with SERPAPI_KEY in .env or the environment):
++    python backend/scripts/spike_serp.py --image-url https://... --image-url https://...
++    python backend/scripts/spike_serp.py --image-file photos/bottle.jpg --image-file photos/mug.jpg
++    python backend/scripts/spike_serp.py --image-file photos/bottle.jpg --query "yellow version"
++Add --out backend/scripts/spike_results.json to save the summary.
+ 
+-STUB: not implemented yet.
++Uses real quota: run by hand only, never in tests. About 2 searches per image (Lens + Shopping).
+ """
+ from __future__ import annotations
+ 
+ import argparse
+-import os
++import json
++import sys
++import time
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(REPO_ROOT))
+ 
+ 
+ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="SerpApi feasibility spike (Stage 1a)")
+-    parser.add_argument("--image-url", help="Image URL for Google Lens")
+-    parser.add_argument("--query", help="Google Shopping query (defaults to the top Lens title)")
++    parser.add_argument("--image-url", action="append", default=[], help="Image URL for Google Lens (repeatable)")
++    parser.add_argument("--image-file", action="append", default=[], help="Local image for the upload flow (repeatable)")
++    parser.add_argument("--query", help="Text refinement appended to the Shopping query (e.g. 'yellow version')")
++    parser.add_argument("--no-shopping", action="store_true", help="Only run Lens")
++    parser.add_argument("--out", help="Write the summary JSON here")
+     return parser.parse_args(argv)
+ 
+ 
++def _coverage(items: list[dict], *fields: str) -> dict[str, str]:
++    n = len(items)
++    out = {}
++    for f in fields:
++        have = sum(1 for it in items if it.get(f) not in (None, "", {}))
++        out[f] = f"{have}/{n}"
++    return out
++
++
++def run_one(label: str, *, image_url: str | None, image_bytes: bytes | None,
++            refinement: str | None, shopping: bool) -> dict:
++    from backend.app.services import serp
++
++    row: dict = {"image": label}
++    meta: dict = {}
++    t0 = time.perf_counter()
++    lens = serp.lens_search(image_url=image_url, image_bytes=image_bytes, meta=meta)
++    row["lens_ms"] = round((time.perf_counter() - t0) * 1000)
++    row["lens_cached"] = meta.get("cached")
++    vm = lens.get("visual_matches") or []
++    row["lens_results"] = len(vm)
++    row["lens_coverage"] = _coverage(vm, "price", "rating", "reviews", "image", "thumbnail")
++    row["lens_top_titles"] = [m.get("title") for m in vm[:3]]
++    row["searches_used"] = 0 if meta.get("cached") else 1
++
++    if shopping and vm:
++        q = vm[0].get("title", "")
++        if refinement:
++            q = f"{q} {refinement}"
++        meta = {}
++        t0 = time.perf_counter()
++        shop = serp.shopping_search(q, meta=meta)
++        row["shopping_ms"] = round((time.perf_counter() - t0) * 1000)
++        row["shopping_cached"] = meta.get("cached")
++        sr = shop.get("shopping_results") or []
++        row["shopping_query"] = q
++        row["shopping_results"] = len(sr)
++        row["shopping_coverage"] = _coverage(sr, "extracted_price", "rating", "reviews", "thumbnail")
++        row["searches_used"] += 0 if meta.get("cached") else 1
++    return row
++
++
+ def main(argv: list[str] | None = None) -> None:
+-    parse_args(argv)
+-    api_key = os.environ.get("SERPAPI_KEY", "")
+-    if not api_key:
++    args = parse_args(argv)
++    from backend.app.config import get_settings
++
++    if not get_settings().SERPAPI_KEY:
+         raise SystemExit("SERPAPI_KEY is not set (copy .env.example to .env and fill it in)")
+-    raise NotImplementedError("TODO: Stage 1a (spike_serp)")
++    if not args.image_url and not args.image_file:
++        raise SystemExit("give at least one --image-url or --image-file")
++
++    rows = []
++    for url in args.image_url:
++        rows.append(run_one(url, image_url=url, image_bytes=None,
++                            refinement=args.query, shopping=not args.no_shopping))
++    for path in args.image_file:
++        rows.append(run_one(path, image_url=None, image_bytes=Path(path).read_bytes(),
++                            refinement=args.query, shopping=not args.no_shopping))
++
++    for r in rows:
++        print(json.dumps(r, indent=2))
++    live = [r for r in rows if not r.get("lens_cached")]
++    if live:
++        avg = sum(r["lens_ms"] + r.get("shopping_ms", 0) for r in live) / len(live)
++        print(f"\nAverage live latency (Lens + Shopping): {avg:.0f} ms over {len(live)} images")
++    print(f"Searches used this run: {sum(r['searches_used'] for r in rows)}")
++    if args.out:
++        Path(args.out).write_text(json.dumps(rows, indent=2))
++        print(f"Saved summary to {args.out}")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/backend/tests/conftest.py b/backend/tests/conftest.py
+index 2440a99..516b8fe 100644
+--- a/backend/tests/conftest.py
++++ b/backend/tests/conftest.py
+@@ -22,6 +22,19 @@ def _isolated_settings(monkeypatch, tmp_path):
+     get_settings.cache_clear()
+ 
+ 
++@pytest.fixture(autouse=True)
++def _no_network(monkeypatch):
++    """Any test that reaches SerpApi or an image download without patching it fails loudly."""
++    from backend.app.services import images, serp
++
++    def _blocked(*args, **kwargs):
++        raise AssertionError("tests must never call the network")
++
++    monkeypatch.setattr(serp, "_http_get", _blocked)
++    monkeypatch.setattr(serp, "_http_upload", _blocked)
++    monkeypatch.setattr(images, "_download", _blocked)
++
++
+ @pytest.fixture
+ def client() -> TestClient:
+     from backend.app.main import app
+diff --git a/backend/tests/data/ranking_test_vectors.proposed.json b/backend/tests/data/ranking_test_vectors.proposed.json
+new file mode 100644
+index 0000000..3186545
+--- /dev/null
++++ b/backend/tests/data/ranking_test_vectors.proposed.json
+@@ -0,0 +1,676 @@
++{
++  "version": 1,
++  "spec": "see docs/contracts.md C7",
++  "_status": "PROPOSED by Stream C (2026-11-27). Needs team approval before it replaces shared/ranking_test_vectors.json.",
++  "_interpretations": [
++    "Rated pool = candidates with a non-null rating. C (mean rating) and m (median review count) are computed over the rated pool only.",
++    "adjusted_rating, top_rated, frontier and best_value contain rated-pool ids only; top_cheapest includes unrated candidates.",
++    "m is the statistical median (even count: mean of the two middle values), then max(m, 1). Null review_count counts as 0.",
++    "Ties: top_cheapest -> lower price, then input order. top_rated -> higher adj, then higher review_count, then input order. best_value -> higher score, then input order.",
++    "Prices <= 0 are excluded from the pool."
++  ],
++  "cases": [
++    {
++      "name": "basic_mixed_pool",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 20.0,
++            "rating": 4.5,
++            "review_count": 1000
++          },
++          {
++            "id": "b",
++            "price": 15.0,
++            "rating": 4.0,
++            "review_count": 200
++          },
++          {
++            "id": "c",
++            "price": 30.0,
++            "rating": 4.8,
++            "review_count": 5000
++          },
++          {
++            "id": "d",
++            "price": 25.0,
++            "rating": 4.2,
++            "review_count": 50
++          },
++          {
++            "id": "e",
++            "price": 18.0,
++            "rating": 3.9,
++            "review_count": 800
++          }
++        ],
++        "weight": 0.5
++      },
++      "expected": {
++        "adjusted_rating": {
++          "a": 4.402222222,
++          "b": 4.224,
++          "c": 4.728275862,
++          "d": 4.275294118,
++          "e": 4.09
++        },
++        "top_cheapest": [
++          "b",
++          "e",
++          "a"
++        ],
++        "top_rated": [
++          "c",
++          "a",
++          "d"
++        ],
++        "frontier": [
++          "a",
++          "b",
++          "c"
++        ],
++        "best_value": [
++          "b",
++          "a",
++          "c"
++        ]
++      }
++    },
++    {
++      "name": "null_review_count_counts_as_zero",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 10.0,
++            "rating": 5.0,
++            "review_count": null
++          },
++          {
++            "id": "b",
++            "price": 12.0,
++            "rating": 4.6,
++            "review_count": 300
++          },
++          {
++            "id": "c",
++            "price": 14.0,
++            "rating": 4.4,
++            "review_count": 100
++          }
++        ],
++        "weight": 0.5
++      },
++      "expected": {
++        "adjusted_rating": {
++          "a": 4.666666667,
++          "b": 4.616666667,
++          "c": 4.533333333
++        },
++        "top_cheapest": [
++          "a",
++          "b",
++          "c"
++        ],
++        "top_rated": [
++          "a",
++          "b",
++          "c"
++        ],
++        "frontier": [
++          "a"
++        ],
++        "best_value": [
++          "a",
++          "b",
++          "c"
++        ]
++      }
++    },
++    {
++      "name": "null_rating_only_in_cheapest",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 9.0,
++            "rating": null,
++            "review_count": null
++          },
++          {
++            "id": "b",
++            "price": 12.0,
++            "rating": 4.6,
++            "review_count": 300
++          },
++          {
++            "id": "c",
++            "price": 14.0,
++            "rating": 4.4,
++            "review_count": 100
++          },
++          {
++            "id": "d",
++            "price": 11.0,
++            "rating": 4.1,
++            "review_count": 40
++          }
++        ],
++        "weight": 0.5
++      },
++      "expected": {
++        "adjusted_rating": {
++          "b": 4.541666667,
++          "c": 4.383333333,
++          "d": 4.29047619
++        },
++        "top_cheapest": [
++          "a",
++          "d",
++          "b"
++        ],
++        "top_rated": [
++          "b",
++          "c",
++          "d"
++        ],
++        "frontier": [
++          "b",
++          "d"
++        ],
++        "best_value": [
++          "b",
++          "d",
++          "c"
++        ]
++      }
++    },
++    {
++      "name": "top_rated_tie_broken_by_review_count",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 10.0,
++            "rating": 4.0,
++            "review_count": 1
++          },
++          {
++            "id": "b",
++            "price": 11.0,
++            "rating": 4.0,
++            "review_count": 1
++          },
++          {
++            "id": "c",
++            "price": 12.0,
++            "rating": 4.0,
++            "review_count": 3
++          },
++          {
++            "id": "d",
++            "price": 13.0,
++            "rating": 4.0,
++            "review_count": 1
++          }
++        ],
++        "weight": 0.5
++      },
++      "expected": {
++        "adjusted_rating": {
++          "a": 4.0,
++          "b": 4.0,
++          "c": 4.0,
++          "d": 4.0
++        },
++        "top_cheapest": [
++          "a",
++          "b",
++          "c"
++        ],
++        "top_rated": [
++          "c",
++          "a",
++          "b"
++        ],
++        "frontier": [
++          "a"
++        ],
++        "best_value": [
++          "a",
++          "b",
++          "c"
++        ]
++      }
++    },
++    {
++      "name": "all_equal_pool_norm_is_half",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 20.0,
++            "rating": 4.0,
++            "review_count": 100
++          },
++          {
++            "id": "b",
++            "price": 20.0,
++            "rating": 4.0,
++            "review_count": 100
++          },
++          {
++            "id": "c",
++            "price": 20.0,
++            "rating": 4.0,
++            "review_count": 100
++          }
++        ],
++        "weight": 0.5
++      },
++      "expected": {
++        "adjusted_rating": {
++          "a": 4.0,
++          "b": 4.0,
++          "c": 4.0
++        },
++        "top_cheapest": [
++          "a",
++          "b",
++          "c"
++        ],
++        "top_rated": [
++          "a",
++          "b",
++          "c"
++        ],
++        "frontier": [
++          "a",
++          "b",
++          "c"
++        ],
++        "best_value": [
++          "a",
++          "b",
++          "c"
++        ]
++      }
++    },
++    {
++      "name": "dominated_candidate_off_frontier",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 10.0,
++            "rating": 4.8,
++            "review_count": 2000
++          },
++          {
++            "id": "b",
++            "price": 15.0,
++            "rating": 4.5,
++            "review_count": 500
++          },
++          {
++            "id": "c",
++            "price": 8.0,
++            "rating": 4.0,
++            "review_count": 300
++          },
++          {
++            "id": "d",
++            "price": 12.0,
++            "rating": 4.9,
++            "review_count": 4000
++          }
++        ],
++        "weight": 0.5
++      },
++      "expected": {
++        "adjusted_rating": {
++          "a": 4.703846154,
++          "b": 4.535714286,
++          "c": 4.443548387,
++          "d": 4.816666667
++        },
++        "top_cheapest": [
++          "c",
++          "a",
++          "d"
++        ],
++        "top_rated": [
++          "d",
++          "a",
++          "b"
++        ],
++        "frontier": [
++          "a",
++          "c",
++          "d"
++        ],
++        "best_value": [
++          "d",
++          "a",
++          "c"
++        ]
++      }
++    },
++    {
++      "name": "cheapest_tie_keeps_input_order",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 10.0,
++            "rating": 4.0,
++            "review_count": 10
++          },
++          {
++            "id": "b",
++            "price": 10.0,
++            "rating": 4.4,
++            "review_count": 10
++          },
++          {
++            "id": "c",
++            "price": 9.0,
++            "rating": 3.5,
++            "review_count": 10
++          },
++          {
++            "id": "d",
++            "price": 11.0,
++            "rating": 4.9,
++            "review_count": 10
++          }
++        ],
++        "weight": 0.5
++      },
++      "expected": {
++        "adjusted_rating": {
++          "a": 4.1,
++          "b": 4.3,
++          "c": 3.85,
++          "d": 4.55
++        },
++        "top_cheapest": [
++          "c",
++          "a",
++          "b"
++        ],
++        "top_rated": [
++          "d",
++          "b",
++          "a"
++        ],
++        "frontier": [
++          "b",
++          "c",
++          "d"
++        ],
++        "best_value": [
++          "b",
++          "c",
++          "d"
++        ]
++      }
++    },
++    {
++      "name": "weight_one_rating_only",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 50.0,
++            "rating": 4.9,
++            "review_count": 900
++          },
++          {
++            "id": "b",
++            "price": 10.0,
++            "rating": 3.8,
++            "review_count": 900
++          },
++          {
++            "id": "c",
++            "price": 25.0,
++            "rating": 4.4,
++            "review_count": 900
++          },
++          {
++            "id": "d",
++            "price": 5.0,
++            "rating": 3.0,
++            "review_count": 900
++          }
++        ],
++        "weight": 1.0
++      },
++      "expected": {
++        "adjusted_rating": {
++          "a": 4.4625,
++          "b": 3.9125,
++          "c": 4.2125,
++          "d": 3.5125
++        },
++        "top_cheapest": [
++          "d",
++          "b",
++          "c"
++        ],
++        "top_rated": [
++          "a",
++          "c",
++          "b"
++        ],
++        "frontier": [
++          "a",
++          "b",
++          "c",
++          "d"
++        ],
++        "best_value": [
++          "a",
++          "c",
++          "b"
++        ]
++      }
++    },
++    {
++      "name": "weight_zero_price_only",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 50.0,
++            "rating": 4.9,
++            "review_count": 900
++          },
++          {
++            "id": "b",
++            "price": 10.0,
++            "rating": 3.8,
++            "review_count": 900
++          },
++          {
++            "id": "c",
++            "price": 25.0,
++            "rating": 4.4,
++            "review_count": 900
++          },
++          {
++            "id": "d",
++            "price": 5.0,
++            "rating": 3.0,
++            "review_count": 900
++          }
++        ],
++        "weight": 0.0
++      },
++      "expected": {
++        "adjusted_rating": {
++          "a": 4.4625,
++          "b": 3.9125,
++          "c": 4.2125,
++          "d": 3.5125
++        },
++        "top_cheapest": [
++          "d",
++          "b",
++          "c"
++        ],
++        "top_rated": [
++          "a",
++          "c",
++          "b"
++        ],
++        "frontier": [
++          "a",
++          "b",
++          "c",
++          "d"
++        ],
++        "best_value": [
++          "d",
++          "b",
++          "c"
++        ]
++      }
++    },
++    {
++      "name": "fewer_than_three",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 19.99,
++            "rating": 4.2,
++            "review_count": 12
++          },
++          {
++            "id": "b",
++            "price": 24.5,
++            "rating": 4.7,
++            "review_count": 48
++          }
++        ],
++        "weight": 0.5
++      },
++      "expected": {
++        "adjusted_rating": {
++          "a": 4.378571429,
++          "b": 4.603846154
++        },
++        "top_cheapest": [
++          "a",
++          "b"
++        ],
++        "top_rated": [
++          "b",
++          "a"
++        ],
++        "frontier": [
++          "a",
++          "b"
++        ],
++        "best_value": [
++          "a",
++          "b"
++        ]
++      }
++    },
++    {
++      "name": "single_candidate",
++      "input": {
++        "candidates": [
++          {
++            "id": "only",
++            "price": 33.0,
++            "rating": 4.1,
++            "review_count": 7
++          }
++        ],
++        "weight": 0.5
++      },
++      "expected": {
++        "adjusted_rating": {
++          "only": 4.1
++        },
++        "top_cheapest": [
++          "only"
++        ],
++        "top_rated": [
++          "only"
++        ],
++        "frontier": [
++          "only"
++        ],
++        "best_value": [
++          "only"
++        ]
++      }
++    },
++    {
++      "name": "even_count_median_and_min_m",
++      "input": {
++        "candidates": [
++          {
++            "id": "a",
++            "price": 10.0,
++            "rating": 4.0,
++            "review_count": 0
++          },
++          {
++            "id": "b",
++            "price": 12.0,
++            "rating": 5.0,
++            "review_count": 0
++          },
++          {
++            "id": "c",
++            "price": 9.0,
++            "rating": 3.0,
++            "review_count": 1
++          },
++          {
++            "id": "d",
++            "price": 15.0,
++            "rating": 4.5,
++            "review_count": 2
++          }
++        ],
++        "weight": 0.5
++      },
++      "expected": {
++        "adjusted_rating": {
++          "a": 4.125,
++          "b": 4.125,
++          "c": 3.5625,
++          "d": 4.375
++        },
++        "top_cheapest": [
++          "c",
++          "a",
++          "b"
++        ],
++        "top_rated": [
++          "d",
++          "a",
++          "b"
++        ],
++        "frontier": [
++          "a",
++          "c",
++          "d"
++        ],
++        "best_value": [
++          "a",
++          "b",
++          "c"
++        ]
++      }
++    }
++  ]
++}
+diff --git a/backend/tests/fakes.py b/backend/tests/fakes.py
+new file mode 100644
+index 0000000..3a2e976
+--- /dev/null
++++ b/backend/tests/fakes.py
+@@ -0,0 +1,90 @@
++"""Offline fakes for SerpApi and image downloads (used by the serp / pipeline / route tests)."""
++from __future__ import annotations
++
++import io
++
++from PIL import Image
++
++COLORS = {
++    "red": (220, 30, 30),
++    "darkred": (210, 20, 25),
++    "blue": (30, 40, 220),
++    "green": (40, 200, 60),
++}
++
++
++def png(color: str = "red", size: int = 64) -> bytes:
++    buf = io.BytesIO()
++    Image.new("RGB", (size, size), COLORS[color]).save(buf, format="PNG")
++    return buf.getvalue()
++
++
++def image_url(color: str, kind: str = "img") -> str:
++    return f"https://img.example.com/{kind}/{color}.png"
++
++
++def fake_download(url: str) -> bytes:
++    """https://img.example.com/<kind>/<color>.png -> a solid-colour PNG. 'broken' fails."""
++    name = url.rsplit("/", 1)[-1].split(".")[0]
++    if name not in COLORS:
++        raise OSError(f"cannot fetch {url}")
++    return png(name)
++
++
++LENS = {
++    "search_metadata": {"status": "Success"},
++    "visual_matches": [
++        {"position": 1, "title": "HydroPeak 32 oz Bottle Red", "link": "https://shop.example.com/1",
++         "source": "Amazon", "price": {"value": "$30*", "extracted_value": 30.0, "currency": "$"},
++         "rating": 4.7, "reviews": 1200, "image": image_url("red"), "thumbnail": image_url("red", "thumb")},
++        {"position": 2, "title": "HydroPeak Bottle Dark Red", "link": "https://shop.example.com/2",
++         "source": "Target", "price": {"value": "$25", "extracted_value": 25.0, "currency": "$"},
++         "rating": 4.4, "reviews": 300, "image": image_url("broken"), "thumbnail": image_url("darkred", "thumb")},
++        {"position": 3, "title": "Blue Mug", "link": "https://shop.example.com/3", "source": "eBay",
++         "price": {"value": "$5", "extracted_value": 5.0, "currency": "$"},
++         "image": image_url("blue")},
++        {"position": 4, "title": "Red Bottle EU", "link": "https://shop.example.eu/4", "source": "Shop EU",
++         "price": {"value": "€20", "extracted_value": 20.0, "currency": "€"}, "rating": 4.9, "reviews": 50,
++         "image": image_url("red")},
++        {"position": 5, "title": "No image entry", "link": "https://shop.example.com/5"},
++    ],
++}
++
++SHOPPING = {
++    "search_metadata": {"status": "Success"},
++    "shopping_results": [
++        {"position": 1, "title": "HydroPeak 32oz Red - Used", "product_link": "https://g.example.com/p1",
++         "source": "Walmart", "price": "$19.99", "extracted_price": 19.99, "rating": 4.5, "reviews": 80,
++         "second_hand_condition": "used", "thumbnail": image_url("red", "thumb")},
++        {"position": 2, "title": "Duplicate of lens 1", "product_link": "https://shop.example.com/1",
++         "source": "Amazon", "price": "$30.00", "extracted_price": 30.0, "thumbnail": image_url("red")},
++        {"position": 3, "title": "Green bottle", "product_link": "https://g.example.com/p3",
++         "source": "REI", "price": "$40.00", "extracted_price": 40.0, "rating": 4.8, "reviews": 900,
++         "thumbnail": image_url("green", "thumb")},
++    ],
++}
++
++
++class FakeSerp:
++    """Stands in for serp._http_get / serp._http_upload and records every call."""
++
++    def __init__(self, lens: dict | None = None, shopping: dict | None = None):
++        self.lens = LENS if lens is None else lens
++        self.shopping = SHOPPING if shopping is None else shopping
++        self.calls: list[dict] = []
++        self.uploads: list[bytes] = []
++
++    def get(self, params: dict) -> tuple[int, dict]:
++        self.calls.append(params)
++        if params["engine"] == "google_lens":
++            return 200, self.lens
++        if params["engine"] == "google_shopping":
++            return 200, self.shopping
++        return 400, {"error": "unknown engine"}
++
++    def upload(self, jpeg: bytes, api_key: str) -> tuple[int, dict]:
++        self.uploads.append(jpeg)
++        return 200, {"image_id": f"img-{len(self.uploads)}"}
++
++    def engines(self) -> list[str]:
++        return [c["engine"] for c in self.calls]
+diff --git a/backend/tests/test_detect.py b/backend/tests/test_detect.py
+new file mode 100644
+index 0000000..9fcf2b1
+--- /dev/null
++++ b/backend/tests/test_detect.py
+@@ -0,0 +1,49 @@
++"""detect.py fallback + crop, and the reviews service's trust_rating."""
++import pytest
++from PIL import Image
++
++from backend.app.schemas import Box
++from backend.app.services import detect, reviews
++
++
++def test_default_detector_is_the_whole_image_fallback():
++    assert detect.detect(Image.new("RGB", (100, 100))) == []
++
++
++def test_yolo_failure_falls_back(monkeypatch):
++    monkeypatch.setenv("DETECTOR", "yolo")
++    from backend.app.config import get_settings
++    get_settings.cache_clear()
++
++    def boom(image):
++        raise ImportError("ultralytics not installed")
++
++    monkeypatch.setattr(detect, "_detect_yolo", boom)
++    assert detect.detect(Image.new("RGB", (100, 100))) == []
++
++
++def test_crop_none_is_whole_image():
++    img = Image.new("RGB", (200, 100))
++    assert detect.crop_to_box(img, None).size == (200, 100)
++
++
++def test_crop_with_padding():
++    img = Image.new("RGB", (200, 100))
++    box = Box(x=0.25, y=0.25, w=0.5, h=0.5, label="bottle", score=0.9)
++    assert detect.crop_to_box(img, box, padding=0.0).size == (100, 50)
++    assert detect.crop_to_box(img, box, padding=0.1).size == (120, 60)
++
++
++def test_crop_padding_is_clamped_to_the_image():
++    img = Image.new("RGB", (200, 100))
++    box = Box(x=0.0, y=0.0, w=1.0, h=1.0, label="all", score=1.0)
++    assert detect.crop_to_box(img, box, padding=0.5).size == (200, 100)
++
++
++def test_trust_rating_weights_helpful_reviews_more():
++    long_review = "word " * 100   # stub helpfulness 1.0
++    short_review = "meh"          # stub helpfulness 0.01
++    t = reviews.trust_rating([5.0, 1.0], [long_review, short_review])
++    assert t == pytest.approx((1.0 * 5 + 0.01 * 1) / 1.01)
++    assert reviews.trust_rating([], []) is None
++    assert reviews.trust_rating([4.0], [""]) is None
+diff --git a/backend/tests/test_images.py b/backend/tests/test_images.py
+new file mode 100644
+index 0000000..b1e5893
+--- /dev/null
++++ b/backend/tests/test_images.py
+@@ -0,0 +1,107 @@
++"""images.py: URL safety, base64 limits, disk cache and offline mode. All offline."""
++import base64
++import socket
++
++import pytest
++
++from backend.app.config import get_settings
++from backend.app.services import images
++from backend.tests.fakes import fake_download, image_url, png
++
++
++@pytest.mark.parametrize("url", [
++    "file:///etc/passwd",
++    "ftp://example.com/a.png",
++    "http://127.0.0.1/a.png",
++    "http://localhost:8000/a.png",
++    "http://10.0.0.5/a.png",
++    "http://192.168.1.1/a.png",
++    "http://169.254.169.254/latest/meta-data",
++    "http://[::1]/a.png",
++    "http:///nohost.png",
++])
++def test_unsafe_urls_are_rejected(url):
++    with pytest.raises(images.UnsafeURLError):
++        images.check_url(url)
++
++
++def test_public_address_is_allowed(monkeypatch):
++    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(None, None, None, None, ("93.184.215.14", 443))])
++    images.check_url("https://example.com/a.png")
++
++
++def test_host_resolving_to_private_ip_is_rejected(monkeypatch):
++    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(None, None, None, None, ("10.1.2.3", 443))])
++    with pytest.raises(images.UnsafeURLError):
++        images.check_url("https://sneaky.example.com/a.png")
++
++
++def test_base64_round_trip_and_data_url_prefix():
++    raw = png("blue")
++    b64 = base64.b64encode(raw).decode()
++    assert images.decode_base64(b64) == raw
++    assert images.decode_base64("data:image/png;base64," + b64) == raw
++    assert images.load_image(raw).size == (64, 64)
++
++
++def test_base64_size_cap(monkeypatch):
++    monkeypatch.setenv("MAX_IMAGE_BYTES", "100")
++    get_settings.cache_clear()
++    with pytest.raises(images.ImageError):
++        images.decode_base64(base64.b64encode(b"x" * 1000).decode())
++
++
++def test_not_an_image():
++    with pytest.raises(images.ImageError):
++        images.load_image(b"definitely not an image")
++
++
++def test_to_jpeg_respects_limit():
++    from PIL import Image
++    big = Image.new("RGB", (3000, 2000), (10, 200, 30))
++    out = images.to_jpeg(big, max_bytes=50_000)
++    assert len(out) <= 50_000 and out[:3] == b"\xff\xd8\xff"
++
++
++def test_fetch_caches_to_disk_and_offline_mode_reads_it(monkeypatch):
++    calls = []
++
++    def dl(url):
++        calls.append(url)
++        return fake_download(url)
++
++    monkeypatch.setattr(images, "_download", dl)
++    url = image_url("red")
++    assert images.fetch_bytes(url) == png("red")
++    assert images.fetch_bytes(url) == png("red")
++    assert calls == [url]  # second read came from disk
++
++    monkeypatch.setenv("DEMO_CACHED", "true")
++    get_settings.cache_clear()
++    assert images.fetch_bytes(url) == png("red")
++    with pytest.raises(images.OfflineCacheMiss):
++        images.fetch_bytes(image_url("blue"))
++
++
++def test_fetch_many_falls_back_to_thumbnail_and_keeps_order(monkeypatch):
++    monkeypatch.setattr(images, "_download", fake_download)
++    out = images.fetch_many([
++        [image_url("broken"), image_url("red", "thumb")],
++        [image_url("blue")],
++        [image_url("broken"), None],
++    ])
++    assert out[0] is not None and out[0].getpixel((0, 0)) == (220, 30, 30)
++    assert out[1] is not None and out[1].getpixel((0, 0)) == (30, 40, 220)
++    assert out[2] is None
++
++
++def test_same_url_fetched_concurrently_does_not_race(monkeypatch):
++    import time
++
++    def slow(url):
++        time.sleep(0.01)
++        return fake_download(url)
++
++    monkeypatch.setattr(images, "_download", slow)
++    out = images.fetch_many([[image_url("red")]] * 16)
++    assert all(im is not None for im in out)
+diff --git a/backend/tests/test_pipeline.py b/backend/tests/test_pipeline.py
+new file mode 100644
+index 0000000..c6be385
+--- /dev/null
++++ b/backend/tests/test_pipeline.py
+@@ -0,0 +1,109 @@
++"""The live pipeline end to end with fake SerpApi + fake image downloads. All offline."""
++import base64
++
++import pytest
++
++from backend.app.config import get_settings
++from backend.app.schemas import Box, SearchRequest
++from backend.app.services import images, pipeline, serp
++from backend.tests.fakes import FakeSerp, fake_download, image_url, png
++
++
++@pytest.fixture
++def fake(monkeypatch):
++    monkeypatch.setenv("SERPAPI_KEY", "test-key")
++    monkeypatch.setenv("USE_MOCK_RESPONSE", "false")
++    get_settings.cache_clear()
++    f = FakeSerp()
++    monkeypatch.setattr(serp, "_http_get", f.get)
++    monkeypatch.setattr(serp, "_http_upload", f.upload)
++    monkeypatch.setattr(images, "_download", fake_download)
++    return f
++
++
++def b64(color="red"):
++    return base64.b64encode(png(color)).decode()
++
++
++def test_full_pipeline_returns_a_valid_response(fake):
++    resp = pipeline.run_search(SearchRequest(image_base64=b64("red")))
++    ids = {c.id for c in resp.candidates}
++    by_id = {c.id: c for c in resp.candidates}
++
++    # Lens entry without an image is dropped; Shopping duplicate of lens 1 is de-duplicated.
++    assert ids == {"l1", "l2", "l3", "l4", "s1", "s3"}
++    assert by_id["l1"].match_label == "identical"
++    assert by_id["l2"].match_label in {"identical", "similar"}  # fetched via thumbnail fallback
++    assert by_id["l3"].match_label == "none"                    # blue vs red
++    assert by_id["s1"].description == "Condition: used"
++    assert by_id["l4"].currency == "EUR"
++
++    # Ranking only uses USD identical/similar candidates.
++    for key in ("top_cheapest", "top_rated", "best_value", "frontier"):
++        assert set(getattr(resp, key)) <= {"l1", "l2", "s1"}, key
++    assert resp.top_cheapest[0] == "s1"
++    assert by_id["l1"].adjusted_rating is not None and by_id["l3"].adjusted_rating is None
++
++    assert resp.cached is False and resp.detections == [] and resp.selected_box is None
++    assert {"decode", "detect", "lens", "shopping", "match", "rank", "total"} <= set(resp.timings_ms)
++    assert fake.engines() == ["google_lens", "google_shopping"]
++    assert fake.calls[1]["q"] == "HydroPeak 32 oz Bottle Red"
++
++
++def test_second_identical_request_is_served_from_cache(fake):
++    req = SearchRequest(image_base64=b64("red"))
++    first = pipeline.run_search(req)
++    second = pipeline.run_search(req)
++    assert second.cached is True and second.query_id == first.query_id
++    assert len(fake.calls) == 2
++
++
++def test_refinement_reuses_lens_and_only_costs_shopping(fake):
++    pipeline.run_search(SearchRequest(image_base64=b64("red")))
++    resp = pipeline.run_search(SearchRequest(image_base64=b64("red"), text="yellow version"))
++    assert fake.engines() == ["google_lens", "google_shopping", "google_shopping"]
++    assert fake.calls[-1]["q"] == "HydroPeak 32 oz Bottle Red yellow version"
++    assert resp.cached is False
++
++
++def test_url_input_without_box_uses_lens_url_flow(fake):
++    pipeline.run_search(SearchRequest(image_url=image_url("red")))
++    assert fake.calls[0]["url"] == image_url("red") and fake.uploads == []
++
++
++def test_user_box_is_used_and_crop_is_uploaded(fake):
++    box = Box(x=0.1, y=0.1, w=0.5, h=0.5, label="user", score=1.0)
++    resp = pipeline.run_search(SearchRequest(image_url=image_url("red"), box=box))
++    assert resp.selected_box == box and len(fake.uploads) == 1
++
++
++def test_demo_cached_mode_works_offline_after_one_live_run(fake, monkeypatch):
++    req = SearchRequest(image_base64=b64("red"))
++    live = pipeline.run_search(req)
++    monkeypatch.setenv("DEMO_CACHED", "true")
++    get_settings.cache_clear()
++    monkeypatch.setattr(images, "_download", lambda url: (_ for _ in ()).throw(AssertionError("network")))
++    cached = pipeline.run_search(req)
++    assert cached.cached is True
++    assert [c.match_label for c in cached.candidates] == [c.match_label for c in live.candidates]
++
++
++def test_demo_cached_miss_raises(fake, monkeypatch):
++    monkeypatch.setenv("DEMO_CACHED", "true")
++    get_settings.cache_clear()
++    with pytest.raises(serp.CacheMiss):
++        pipeline.run_search(SearchRequest(image_base64=b64("blue")))
++
++
++def test_empty_lens_result_gives_empty_lists(fake):
++    fake.lens = {"error": "Google Lens hasn't returned any results for this query."}
++    resp = pipeline.run_search(SearchRequest(image_base64=b64("green")))
++    assert resp.candidates == [] and resp.top_cheapest == [] and resp.frontier == []
++    assert fake.engines() == ["google_lens"]  # no title -> no Shopping search
++
++
++def test_currency_parsing():
++    assert pipeline._currency("$19.99") == "USD"
++    assert pipeline._currency("€") == "EUR"
++    assert pipeline._currency(None) == "USD"
++    assert pipeline._currency("C$12") == "CAD"
+diff --git a/backend/tests/test_ranking.py b/backend/tests/test_ranking.py
+index cefa9e3..e918351 100644
+--- a/backend/tests/test_ranking.py
++++ b/backend/tests/test_ranking.py
+@@ -1,4 +1,9 @@
+-"""C7 ranking tests driven by shared/ranking_test_vectors.json. Skipped while `cases` is empty."""
++"""C7 ranking tests driven by the ranking test vectors.
++
++- shared/ranking_test_vectors.json: the contract file (skipped while `cases` is empty).
++- backend/tests/data/ranking_test_vectors.proposed.json: Stream C's proposed cases, waiting for
++  team approval. Once approved they are copied into the shared file and this file can be deleted.
++"""
+ import json
+ from pathlib import Path
+ 
+@@ -6,20 +11,59 @@ import pytest
+ 
+ from backend.app.services import ranking
+ 
+-VECTORS_PATH = Path(__file__).resolve().parents[2] / "shared" / "ranking_test_vectors.json"
++ROOT = Path(__file__).resolve().parents[2]
++SHARED = ROOT / "shared" / "ranking_test_vectors.json"
++PROPOSED = Path(__file__).resolve().parent / "data" / "ranking_test_vectors.proposed.json"
+ 
+-CASES = json.loads(VECTORS_PATH.read_text())["cases"]
+ TOL = 1e-6
+ 
+ 
+-@pytest.mark.skipif(not CASES, reason="shared/ranking_test_vectors.json has no cases yet (Stream C, Stage 4e)")
+-@pytest.mark.parametrize("case", CASES, ids=[c.get("name", str(i)) for i, c in enumerate(CASES)])
+-def test_ranking_vector(case):
++def _cases(path: Path) -> list[dict]:
++    return json.loads(path.read_text())["cases"] if path.is_file() else []
++
++
++SHARED_CASES = _cases(SHARED)
++PROPOSED_CASES = _cases(PROPOSED)
++
++
++def _check(case: dict) -> None:
+     inp, exp = case["input"], case["expected"]
+     out = ranking.top_k_lists(inp["candidates"], weight=inp.get("weight", 0.5))
++    assert set(out["adjusted_rating"]) == set(exp["adjusted_rating"])
+     for cid, val in exp["adjusted_rating"].items():
+         assert out["adjusted_rating"][cid] == pytest.approx(val, abs=TOL)
+     assert out["top_cheapest"] == exp["top_cheapest"]
+     assert out["top_rated"] == exp["top_rated"]
+     assert sorted(out["frontier"]) == sorted(exp["frontier"])
+     assert out["best_value"] == exp["best_value"]
++
++
++@pytest.mark.skipif(not SHARED_CASES, reason="shared/ranking_test_vectors.json has no cases yet")
++@pytest.mark.parametrize("case", SHARED_CASES, ids=[c.get("name", str(i)) for i, c in enumerate(SHARED_CASES)])
++def test_ranking_vector(case):
++    _check(case)
++
++
++@pytest.mark.skipif(not PROPOSED_CASES, reason="no proposed vectors file")
++@pytest.mark.parametrize("case", PROPOSED_CASES, ids=[c.get("name", str(i)) for i, c in enumerate(PROPOSED_CASES)])
++def test_proposed_ranking_vector(case):
++    _check(case)
++
++
++def test_none_label_and_missing_price_are_outside_the_pool():
++    cands = [
++        {"id": "keep", "price": 10.0, "rating": 4.0, "review_count": 5, "match_label": "identical"},
++        {"id": "sim", "price": 12.0, "rating": 4.5, "review_count": 5, "match_label": "similar"},
++        {"id": "none", "price": 1.0, "rating": 5.0, "review_count": 999, "match_label": "none"},
++        {"id": "noprice", "price": None, "rating": 5.0, "review_count": 999, "match_label": "identical"},
++        {"id": "zero", "price": 0.0, "rating": 5.0, "review_count": 999, "match_label": "identical"},
++    ]
++    out = ranking.top_k_lists(cands)
++    for key in ("top_cheapest", "top_rated", "frontier", "best_value"):
++        assert set(out[key]) <= {"keep", "sim"}, key
++    assert set(out["adjusted_rating"]) == {"keep", "sim"}
++
++
++def test_empty_input():
++    out = ranking.top_k_lists([])
++    assert out == {"adjusted_rating": {}, "top_cheapest": [], "top_rated": [], "frontier": [], "best_value": []}
+diff --git a/backend/tests/test_search_mock.py b/backend/tests/test_search_mock.py
+index beecaef..70b6c9f 100644
+--- a/backend/tests/test_search_mock.py
++++ b/backend/tests/test_search_mock.py
+@@ -13,8 +13,49 @@ def test_search_rejects_empty_body(client):
+     assert client.post("/api/search", json={}).status_code == 422
+ 
+ 
+-def test_search_live_not_implemented(client, monkeypatch):
++def test_live_mode_runs_the_pipeline(client, monkeypatch):
++    from backend.app.services import images, serp
++    from backend.tests.fakes import FakeSerp, fake_download, image_url
++
+     monkeypatch.setenv("USE_MOCK_RESPONSE", "false")
++    monkeypatch.setenv("SERPAPI_KEY", "test-key")
+     get_settings.cache_clear()
+-    r = client.post("/api/search", json={"image_url": "https://example.com/a.jpg"})
+-    assert r.status_code == 501
++    fake = FakeSerp()
++    monkeypatch.setattr(serp, "_http_get", fake.get)
++    monkeypatch.setattr(serp, "_http_upload", fake.upload)
++    monkeypatch.setattr(images, "_download", fake_download)
++    r = client.post("/api/search", json={"image_url": image_url("red")})
++    assert r.status_code == 200, r.text
++    body = SearchResponse.model_validate(r.json())
++    assert body.candidates and body.cached is False
++
++
++def test_live_mode_error_codes(client, monkeypatch):
++    from backend.app.services import pipeline, serp
++
++    monkeypatch.setenv("USE_MOCK_RESPONSE", "false")
++    get_settings.cache_clear()
++    cases = [
++        (serp.QuotaExhausted("out"), 503, "quota_exhausted"),
++        (serp.CacheMiss("miss"), 503, "cache_miss"),
++        (serp.MissingKey("key"), 503, "no_api_key"),
++        (serp.SerpError("boom"), 502, "upstream_error"),
++    ]
++    for exc, status, code in cases:
++        def raiser(req, exc=exc):
++            raise exc
++        monkeypatch.setattr(pipeline, "run_search", raiser)
++        r = client.post("/api/search", json={"image_url": "https://example.com/a.jpg"})
++        assert r.status_code == status and r.json()["detail"]["code"] == code
++
++
++def test_live_mode_bad_base64_is_400(client, monkeypatch):
++    monkeypatch.setenv("USE_MOCK_RESPONSE", "false")
++    get_settings.cache_clear()
++    r = client.post("/api/search", json={"image_base64": "bm90IGFuIGltYWdl"})  # "not an image"
++    assert r.status_code == 400 and r.json()["detail"]["code"] == "bad_image"
++
++
++def test_quota_endpoint(client):
++    r = client.get("/api/quota")
++    assert r.status_code == 200 and r.json()["used"] == {}
+diff --git a/backend/tests/test_serp.py b/backend/tests/test_serp.py
+new file mode 100644
+index 0000000..b695018
+--- /dev/null
++++ b/backend/tests/test_serp.py
+@@ -0,0 +1,126 @@
++"""serp.py: cache-first behaviour, quota log, DEMO_CACHED, errors. All offline."""
++import json
++from pathlib import Path
++
++import pytest
++
++from backend.app.config import get_settings
++from backend.app.services import cache, serp
++from backend.tests.fakes import FakeSerp, png
++
++
++@pytest.fixture
++def fake(monkeypatch):
++    monkeypatch.setenv("SERPAPI_KEY", "test-key")
++    get_settings.cache_clear()
++    f = FakeSerp()
++    monkeypatch.setattr(serp, "_http_get", f.get)
++    monkeypatch.setattr(serp, "_http_upload", f.upload)
++    return f
++
++
++def test_lens_upload_then_cache_hit(fake):
++    meta = {}
++    first = serp.lens_search(image_bytes=png("red"), meta=meta)
++    assert meta["cached"] is False
++    assert fake.engines() == ["google_lens"] and len(fake.uploads) == 1
++    assert fake.calls[0]["image_id"] == "img-1" and fake.calls[0]["api_key"] == "test-key"
++
++    meta = {}
++    second = serp.lens_search(image_bytes=png("red"), meta=meta)
++    assert meta["cached"] is True and second == first
++    assert len(fake.calls) == 1 and len(fake.uploads) == 1  # no new quota
++
++
++def test_raw_response_is_cached_under_the_c4_key(fake):
++    serp.lens_search(image_url="https://img.example.com/a.jpg")
++    key = cache.cache_key(b"https://img.example.com/a.jpg", "google_lens", None)
++    assert cache.load(key) == fake.lens
++    assert fake.calls[0]["url"] == "https://img.example.com/a.jpg"
++
++
++def test_shopping_key_uses_query_text(fake):
++    serp.shopping_search("HydroPeak bottle  yellow")
++    key = cache.cache_key(b"", "google_shopping", "HydroPeak bottle yellow")
++    assert cache.load(key) == fake.shopping
++    assert fake.calls[0]["q"] == "HydroPeak bottle yellow"
++
++
++def test_quota_log_counts_real_calls_only(fake):
++    serp.shopping_search("a")
++    serp.shopping_search("a")  # cache hit
++    serp.shopping_search("b")
++    assert serp.quota_used() == {"google_shopping": 2}
++    rows = [json.loads(line) for line in
++            (Path(get_settings().CACHE_DIR) / "quota_log.jsonl").read_text().splitlines()]
++    assert all(r["ok"] for r in rows) and {"ts", "engine", "key", "latency_ms"} <= set(rows[0])
++
++
++def test_demo_cached_never_calls_network(fake, monkeypatch):
++    monkeypatch.setenv("DEMO_CACHED", "true")
++    get_settings.cache_clear()
++    with pytest.raises(serp.CacheMiss):
++        serp.shopping_search("never cached")
++    assert fake.calls == []
++
++
++def test_demo_cached_serves_hits(fake, monkeypatch):
++    serp.shopping_search("cached one")
++    monkeypatch.setenv("DEMO_CACHED", "true")
++    get_settings.cache_clear()
++    assert serp.shopping_search("cached one") == fake.shopping
++    assert len(fake.calls) == 1
++
++
++def test_quota_exhausted_is_raised_and_not_cached(fake, monkeypatch):
++    monkeypatch.setattr(serp, "_http_get", lambda p: (200, {"error": "Your account has run out of searches."}))
++    with pytest.raises(serp.QuotaExhausted):
++        serp.shopping_search("x")
++    assert cache.load(cache.cache_key(b"", "google_shopping", "x")) is None
++    assert serp.quota_used() == {"google_shopping": 1}  # failed attempts are logged too
++
++
++def test_http_429_is_quota(fake, monkeypatch):
++    monkeypatch.setattr(serp, "_http_get", lambda p: (429, {}))
++    with pytest.raises(serp.QuotaExhausted):
++        serp.shopping_search("x")
++
++
++def test_other_errors_raise_serp_error(fake, monkeypatch):
++    monkeypatch.setattr(serp, "_http_get", lambda p: (500, {"error": "Internal error"}))
++    with pytest.raises(serp.SerpError):
++        serp.shopping_search("x")
++
++
++def test_no_results_is_a_cached_empty_answer(fake, monkeypatch):
++    body = {"error": "Google Lens hasn't returned any results for this query."}
++    monkeypatch.setattr(serp, "_http_get", lambda p: (200, body))
++    assert serp.lens_search(image_url="https://img.example.com/empty.jpg") == body
++    assert cache.load(cache.cache_key(b"https://img.example.com/empty.jpg", "google_lens", None)) == body
++
++
++def test_missing_key(monkeypatch):
++    monkeypatch.setenv("SERPAPI_KEY", "")
++    get_settings.cache_clear()
++    with pytest.raises(serp.MissingKey):
++        serp.shopping_search("x")
++
++
++def test_big_images_are_shrunk_under_the_upload_limit(fake):
++    import io
++    import numpy as np
++    from PIL import Image
++
++    noise = (np.random.default_rng(0).random((1600, 1600, 3)) * 255).astype("uint8")
++    buf = io.BytesIO()
++    Image.fromarray(noise).save(buf, format="PNG")
++    assert buf.tell() > 500_000
++    serp.lens_search(image_bytes=buf.getvalue())
++    assert len(fake.uploads[0]) <= serp.UPLOAD_MAX_BYTES
++
++
++def test_exactly_one_image_argument():
++    with pytest.raises(ValueError):
++        serp.lens_search()
++    with pytest.raises(ValueError):
++        serp.lens_search(image_url="https://a", image_bytes=b"x")
+diff --git a/docs/notes/stream-c.md b/docs/notes/stream-c.md
+index 696b032..966c519 100644
+--- a/docs/notes/stream-c.md
++++ b/docs/notes/stream-c.md
+@@ -1,10 +1,68 @@
+ # Stream C notes
+ 
+ ## How it works (plain language)
+-- TBD
++- **One request, one pipeline.** `POST /api/search` → `backend/app/services/pipeline.py::run_search`:
++  1. Read the photo (base64 or a URL), fix phone rotation (EXIF).
++  2. `detect.py` finds boxes (or, by default, none: we use the user's box or the whole image) and crops with 5% padding.
++  3. `serp.py` sends the crop to **Google Lens** (upload flow: we shrink it under SerpApi's 500 KB limit, upload, get an `image_id`, then search).
++  4. We take Lens's top title, add the user's refinement text ("yellow version"), and search **Google Shopping**.
++  5. Candidates from both lists are merged and de-duplicated by link.
++  6. `images.py` downloads every candidate image **in parallel** (full-size first, thumbnail if that fails).
++  7. Stream A's matcher scores each image against our crop → `identical / similar / none`.
++  8. `ranking.py` (contract C7) builds the three top-3 lists from identical/similar USD-priced items.
++- **Caching protects our quota.** Every SerpApi answer is saved raw to `backend/app/cache/<sha256>.json`
++  (contract C4). Asking the same thing twice costs 0 searches. Candidate images are cached on disk too.
++- **Cached demo mode.** `DEMO_CACHED=true` → never touch the network. If a query or image wasn't cached,
++  the API returns `503 cache_miss` instead of hanging. Run every demo object once live, then flip it on.
++- **Refinements are cheap.** Same photo + new text reuses the cached Lens result; only Shopping is re-run (1 search).
++- **Quota log.** Every real call is appended to `backend/app/cache/quota_log.jsonl`; `GET /api/quota` shows the counts.
++- **Safe URL fetching.** Only http(s); private/local addresses are blocked (re-checked on redirects);
++  5 s timeout and an 8 MB cap per image, so a user-supplied URL can't make the server read internal services.
+ 
+ ## Key decisions
+-- TBD
++- Cache keys: Lens upload = sha256(crop JPEG bytes + "google_lens"); Lens URL = the URL's bytes stand in for
++  image bytes; Shopping = sha256("" + "google_shopping" + query text).
++- Searches per new query: 1 Lens + 1 Shopping (+ 1 upload, which may or may not count; check on the SerpApi dashboard).
++- Only USD prices enter the ranking pool. Other currencies are shown but not ranked.
++- A candidate whose image can't be downloaded gets score 0 / `none` (shown, never ranked).
++- Used/refurbished condition goes in `description` (answers Sid's new-vs-used question without a contract change).
++- Ranking interpretations (ties, null ratings, median) are listed at the top of
++  `backend/tests/data/ranking_test_vectors.proposed.json`.
++
++## Needs team approval (bring to the Saturday 6 PM call)
++1. **Ranking test vectors.** 12 cases in `backend/tests/data/ranking_test_vectors.proposed.json`. Once the team
++   approves (incl. Shrihan, who must match them in `ranking.ts`), copy `cases` into `shared/ranking_test_vectors.json`.
++2. **Error codes for D** (add to `docs/contracts.md` C1): `400 bad_image`, `503 cache_miss`, `503 quota_exhausted`,
++   `503 no_api_key`, `502 upstream_error`; body `{"detail": {"code", "message"}}`. Shrihan can build error states on these.
++3. **decisions.md (CP1):** detector = fallback (`DETECTOR=none`) unless the YOLO spike looks good; crop padding 5%;
++   ranking m = pool median review count (min 1), C = pool mean, w = 0.5.
++4. **Price-outlier rule** (suggestion 4): not implemented, since it changes the C7 spec. Decide before both sides code it.
++5. **Shrihan's new fields** (`suggestions`, `reviews_scanned`) need a `schemas.py` change; not done.
++
++## Not done yet (later Stream C work)
++- Stage 1a/1b runs: need your SerpApi key and photos (see "How to run" below). Put the numbers in decisions.md.
++- 7e reviews: `reviews.trust_rating` works (helpfulness-weighted mean) but review fetching isn't wired in.
++  Waiting on B's formula; likely uses SerpApi's `google_product` engine for the top 2–3 products only.
++- 4h hosting: `make serve` already serves the built frontend; tunnel: `cloudflared tunnel --url http://localhost:8000`.
++  HF Space backup still to do.
++- Swap in real models (Wed 12/2): nothing to change here; A edits `ml/inference/matcher.py`, B edits `ml/inference/reviews.py`.
++
++## How to run
++```bash
++cp .env.example .env          # put SERPAPI_KEY in .env
++make test                      # all offline
++python backend/scripts/spike_serp.py --image-file photo1.jpg --image-file photo2.jpg --out backend/scripts/spike_results.json
++USE_MOCK_RESPONSE=false make dev-backend
++curl -s localhost:8000/api/search -H 'content-type: application/json' \
++  -d "{\"image_base64\": \"$(base64 -w0 photo1.jpg)\"}" | head -c 600
++```
+ 
+ ## What I'd say if a judge asks…
+-- TBD
++- *"How do you avoid burning your API quota?"* Every response is cached by image hash + engine + text; repeats are free,
++  refinements reuse the Lens result, and we log every real call.
++- *"What if the Wi-Fi dies?"* `DEMO_CACHED=true` serves everything from disk, including candidate images.
++- *"Why not just trust Google Lens's order?"* Lens returns look-alikes. Our matcher re-scores each candidate's
++  full-size image against the user's crop and labels it identical/similar/none, and only those feed the rankings.
++- *"Why is a 4.6 ranked below a 4.4?"* Bayesian average: a 4.6 from 5 reviews is pulled toward the pool mean more than
++  a 4.4 from 5,000 reviews.
++- *"Is it safe to fetch arbitrary URLs?"* http(s) only, private/local IPs blocked on every redirect, timeouts and size caps.
