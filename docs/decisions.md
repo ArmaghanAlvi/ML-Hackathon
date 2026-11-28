@@ -25,11 +25,9 @@ Every locked decision and every fallback used. **Contract file:** changes need t
 - **trust_rating (draft; final by Tue 12/1, Stream B proposes, Stream C implements):** for a candidate with fetched reviews i = 1..n, stars rᵢ and helpfulness hᵢ = score_reviews(textᵢ): trust = (Σ hᵢ·rᵢ + k·adjusted_rating) / (Σ hᵢ + k), k = 3. Null when no reviews were fetched.
 
 ## Labeling definitions
-- **identical:** TBD (draft in `labeling/guidelines.md`)
-- **similar:** TBD
-- **none:** TBD
+- **identical / similar / none:** defined in labeling/guidelines.md (v1.1). Identical = same model, any color/size/pack (same parent_asin).
 - **Real-photo labels:** identical / similar / none as defined in `labeling/guidelines.md` (Identical = same model, matching the matcher's training positives: same `parent_asin`). Labels judge product identity, not whether the page is a store. File formats: `labeling/SCHEMA.md`.
-- **Review helpfulness label:** TBD after the Stage 1a data check (Sat 11/28).
+- **Review helpfulness label (Stage 1a, Fri 11/27):** Amazon Reviews 2023, team categories (all five scanned: Office, Home & Kitchen, Sports, Cell Phones, Electronics); reviews dated 2015-01 … 2021-12 (data ends 2023-09-14; later reviews haven't had time to collect votes). Helpful = ≥3 votes, not helpful = 0, 1–2 dropped. Natural prevalence 6.5%. Chosen from the vote-age curve and counts, not from any model result.
 
 ## Evaluation plan (pre-registered Thu 11/26, before any results)
 Written before any real-photo or review-model result exists. Any later change is logged at the end of this section with its date and reason.
