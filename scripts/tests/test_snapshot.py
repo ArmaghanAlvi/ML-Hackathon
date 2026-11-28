@@ -1,6 +1,8 @@
 """Tests for scripts/snapshot.py. Fake secrets are assembled at runtime so this file itself stays clean."""
+import re
 import subprocess
 import zipfile
+from datetime import datetime
 
 import pytest
 
@@ -85,7 +87,7 @@ def test_end_to_end_includes_uncommitted_and_excludes_unsafe(tmp_path, monkeypat
     assert snapshot.main(["--out", str(out), "--name", "test"]) == 0
 
     [zip_path] = list(out.glob("*.zip"))
-    assert zip_path.name.endswith("-dirty-test.zip")
+    assert re.fullmatch(r"proj_main_snapshot-001_\d{4}-\d{2}-\d{2}_\d{4}_uncommitted_test\.zip", zip_path.name)
     with zipfile.ZipFile(zip_path) as zf:
         prefix = zip_path.stem + "/"
         names = {n.removeprefix(prefix) for n in zf.namelist()}
@@ -94,9 +96,55 @@ def test_end_to_end_includes_uncommitted_and_excludes_unsafe(tmp_path, monkeypat
         assert zf.read(prefix + "committed.py").decode() == "print('v2 uncommitted')\n"
         info = zf.read(prefix + "SNAPSHOT_INFO.txt").decode()
         assert "Uncommitted:     yes" in info and "Branch:          main" in info
+        assert "Snapshot:        #1 for branch main" in info
 
 
 def test_dry_run_writes_nothing(tmp_path, monkeypatch):
     out = tmp_path / "out"
     assert snapshot.main(["--dry-run", "--out", str(out)]) == 0
     assert not out.exists()
+
+
+def test_numbering_counts_up_per_branch_and_skips_gaps(tmp_path):
+    out = tmp_path
+    assert snapshot.next_number(out, "proj", "stream-b-eval") == 1
+    for name in [
+        "proj_stream-b-eval_snapshot-001_2026-11-26_1400.zip",
+        "proj_stream-b-eval_snapshot-004_2026-11-26_1500_uncommitted_before-merge.zip",  # 2 and 3 deleted
+        "proj_stream-a-vision_snapshot-009_2026-11-26_1500.zip",   # other branch
+        "proj_stream-b-eval-old_snapshot-050_2026-11-26_1500.zip", # branch whose name only starts the same
+        "proj-20261126-020055Z-eefe8a7-dirty.zip",                 # old naming scheme
+    ]:
+        (out / name).write_bytes(b"")
+    assert snapshot.next_number(out, "proj", "stream-b-eval") == 5
+    assert snapshot.next_number(out, "proj", "stream-a-vision") == 10
+    assert snapshot.next_number(out, "proj", "main") == 1
+
+
+def test_branch_label_and_stem():
+    base = {"short": "abc1234"}
+    assert snapshot.branch_label({**base, "branch": "stream/b-eval"}) == "stream-b-eval"
+    assert snapshot.branch_label({**base, "branch": "HEAD"}) == "detached-abc1234"
+    assert snapshot.branch_label({**base, "branch": "n/a"}) == "no-git"
+    when = datetime(2026, 11, 26, 14, 32)
+    assert (snapshot.snapshot_stem("ML-Hackathon", "stream-b-eval", 3, when, True, "before merge")
+            == "ML-Hackathon_stream-b-eval_snapshot-003_2026-11-26_1432_uncommitted_before-merge")
+    assert snapshot.snapshot_stem("p", "main", 12, when, False, None) == "p_main_snapshot-012_2026-11-26_1432"
+
+
+def test_second_snapshot_on_same_branch_gets_next_number(tmp_path, monkeypatch):
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "stream/b-eval")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("a\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+    monkeypatch.setattr(snapshot, "REPO_ROOT", repo)
+    out = tmp_path / "out"
+    assert snapshot.main(["--out", str(out)]) == 0
+    assert snapshot.main(["--out", str(out)]) == 0
+    names = sorted(p.name for p in out.glob("*.zip"))
+    assert [n.split("_")[2] for n in names] == ["snapshot-001", "snapshot-002"]
+    assert all(n.startswith("proj_stream-b-eval_") and "uncommitted" not in n for n in names)

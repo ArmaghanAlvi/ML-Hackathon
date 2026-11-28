@@ -24,13 +24,24 @@ Copy `.env.example` to `.env` (and `frontend/.env.example` to `frontend/.env`) t
 ML / notebook dependencies are **not** installed by default: `pip install -r ml/requirements.txt` when you need them.
 
 ### Snapshots
-`make snapshot` zips the project **as it is on your disk right now** (committed, uncommitted and new files) into `snapshots/<project>-<UTC time>-<commit>[-dirty].zip`, whether or not your branch is caught up with GitHub. It never fetches, pushes or changes git state, and needs only plain Python (no venv). It is "safe" to share because:
+`make snapshot` zips the project **as it is on your disk right now** (committed, uncommitted and new files) into `snapshots/`, whether or not your branch is caught up with GitHub. It never fetches, pushes or changes git state, and needs only plain Python (no venv). It is "safe" to share because:
 - it follows `.gitignore` (no `.venv`, `node_modules`, `dist`, `ml/data`, caches, weights),
 - a built-in denylist also drops secrets (`.env`, keys, credentials), datasets, weights, media and the real photos in `labeling/queries/`, even if `.gitignore` misses them,
 - text files containing a filled-in secret (e.g. `SERPAPI_KEY=<real value>`, tokens, private keys) are skipped,
 - files over 25 MB are skipped.
 
-Each zip includes `SNAPSHOT_INFO.txt` with the branch, commit, ahead/behind vs. upstream (as of your last `git fetch`), uncommitted changes and the full list of included and skipped files. Run `--dry-run` first if you want to check what goes in.
+Zip names say which branch the snapshot is of and number snapshots per branch:
+
+```
+<project>_<branch>_snapshot-<NNN>_<YYYY-MM-DD>_<HHMM>[_uncommitted][_<label>].zip
+ML-Hackathon_stream-b-eval_snapshot-003_2026-11-26_1432_uncommitted.zip
+```
+
+- `<branch>` is your current branch with `/` turned into `-`.
+- `<NNN>` counts up per branch: one more than the highest number already in the output folder for that branch, so numbers are never reused even if you delete an old zip.
+- The time is your local time. `_uncommitted` means you had changes that weren't committed yet. `--name <label>` adds your own label at the end.
+
+Each zip includes `SNAPSHOT_INFO.txt` with the snapshot number, branch, commit, ahead/behind vs. upstream (as of your last `git fetch`), uncommitted changes and the full list of included and skipped files. Run `--dry-run` first if you want to check what goes in.
 
 ## Repo map
 
